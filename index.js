@@ -4,6 +4,7 @@ const path=require('path')
 const crypto=require('crypto')
 const express=require('express')
 const cors=require('cors')
+const mongoose=require('mongoose')
 const {QdrantClient}=require('@qdrant/js-client-rest')
 const {EmbeddingModel,FlagEmbedding}=require('fastembed')
 
@@ -27,14 +28,14 @@ const QDRANT_API_KEY=process.env.QDRANT_API_KEY
 const QDRANT_QUESTION_BANK_COLLECTION=process.env.QDRANT_QUESTION_BANK_COLLECTION||'question_bank'
 const QDRANT_KNOWLEDGE_BASE_COLLECTION=process.env.QDRANT_KNOWLEDGE_BASE_COLLECTION||'knowledge_base'
 const QDRANT_GENERATED_QUESTIONS_COLLECTION=process.env.QDRANT_GENERATED_QUESTIONS_COLLECTION||'generated_questions'
-
 const ADMIN_API_KEY=process.env.ADMIN_API_KEY
-
-const PSMODEL_ENDPOINT=process.env.PSMODEL_ENDPOINT||'https://api.deepseek.com/chat/completions'
+const PSMODEL_ENDPOINT=process.env.PSMODEL_ENDPOINT
 const PSMODEL_API_KEY=process.env.PSMODEL_API_KEY
-const PSMODEL_MODEL=process.env.PSMODEL_MODEL||'deepseek-chat'
+const PSMODEL_MODEL=process.env.PSMODEL_MODEL
 const PSMODEL_TIMEOUT_MS=parseInt(process.env.PSMODEL_TIMEOUT_MS||'60000',10)
 const PSMODEL_TEMPERATURE=parseFloat(process.env.PSMODEL_TEMPERATURE||'0.7')
+
+const PSMODELCHATHISDB_URI=process.env.PSMODELCHATHISDB_URI
 
 const EMBEDDING_MODEL_NAME=process.env.EMBEDDING_MODEL_NAME||'BAAI/bge-base-en-v1.5'
 const EMBEDDING_CACHE_DIR=process.env.EMBEDDING_CACHE_DIR||path.join(process.cwd(),'.fastembed_cache')
@@ -43,11 +44,47 @@ const MAX_QUESTIONS_PER_REQUEST=100
 const QUESTION_BANK_TOP_K=parseInt(process.env.QUESTION_BANK_TOP_K||'12',10)
 const KNOWLEDGE_BASE_TOP_K=parseInt(process.env.KNOWLEDGE_BASE_TOP_K||'10',10)
 const GENERATION_BATCH_SIZE=parseInt(process.env.GENERATION_BATCH_SIZE||'10',10)
-const GENERATION_CONCURRENCY=parseInt(process.env.GENERATION_CONCURRENCY||'3',10)
 const SAVE_GENERATED_TO_QDRANT=process.env.SAVE_GENERATED_TO_QDRANT!=='false'
 const QDRANT_UPSERT_BATCH_SIZE=parseInt(process.env.QDRANT_UPSERT_BATCH_SIZE||'64',10)
 
 const qdrant=new QdrantClient({url:QDRANT_URL,apiKey:QDRANT_API_KEY})
+
+const chatHistorySchema=new mongoose.Schema({
+requestId:{type:String,index:true},
+adminQuery:String,
+examType:String,
+subject:String,
+topic:String,
+chapter:String,
+keywords:[String],
+difficulty:String,
+requestedCount:Number,
+generatedCount:Number,
+limitedTo100:Boolean,
+pyqReferencesUsed:Number,
+knowledgeChunksUsed:Number,
+questions:[mongoose.Schema.Types.Mixed],
+model:String,
+savedToQdrant:Number
+},{timestamps:true})
+
+const ChatHistory=mongoose.models.ChatHistory||mongoose.model('ChatHistory',chatHistorySchema,'psmodel_chat_history')
+
+let mongoConnectPromise=null
+function connectMongo(){
+if(!PSMODELCHATHISDB_URI) return Promise.resolve(false)
+if(mongoose.connection.readyState===1) return Promise.resolve(true)
+if(!mongoConnectPromise){
+mongoConnectPromise=mongoose.connect(PSMODELCHATHISDB_URI)
+.then(()=>true)
+.catch(e=>{
+console.error('[mongo connect]',e.message)
+mongoConnectPromise=null
+return false
+})
+}
+return mongoConnectPromise
+}
 
 let embedderPromise=null
 function getEmbedder(){
@@ -87,14 +124,6 @@ next()
 
 function clamp(n,min,max){
 return Math.max(min,Math.min(max,n))
-}
-
-function withTimeout(promise,ms,label){
-let timer
-const timeout=new Promise((_,reject)=>{
-timer=setTimeout(()=>reject(new Error(`${label||'operation'} timed out`)),ms)
-})
-return Promise.race([promise,timeout]).finally(()=>clearTimeout(timer))
 }
 
 function buildSearchText({topic,examType,subject,chapter,keywords}){
@@ -141,6 +170,53 @@ return `[${i+1}] (${label}) ${pl.text||''}`
 }).join('\n\n')
 }
 
+function extractJsonBlock(raw,openChar,closeChar){
+let cleaned=(raw||'').trim()
+cleaned=cleaned.replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim()
+const start=cleaned.indexOf(openChar)
+const end=cleaned.lastIndexOf(closeChar)
+if(start!==-1&&end!==-1&&end>start) cleaned=cleaned.slice(start,end+1)
+return cleaned
+}
+
+function buildAnalyzePrompt(query){
+const system='You are an intent extraction engine for a Civil Services exam question generation system. Extract structured parameters from the admin natural language request. Always respond with strict JSON only, no markdown, no prose, no code fences.'
+const user=`Admin request: "${query}"
+
+Return ONLY a JSON object in this exact shape:
+{"count":null,"examType":null,"subject":null,"topic":null,"chapter":null,"keywords":[],"difficulty":null}
+
+Rules:
+count is the integer number of questions requested, or null if not mentioned.
+examType is the exam name and stage if mentioned, for example "UPSC Prelims", "BPSC", "State PSC Mains", or null.
+topic is the specific topic the questions should be about.
+chapter is the book chapter or syllabus section if identifiable, otherwise same as topic or null.
+subject is the broader subject area such as Polity, History, Geography, Economy, Science, Environment or Current Affairs, inferred from the topic if not explicit.
+keywords is an array of related search terms derived from the request.
+difficulty is "Easy", "Moderate" or "Difficult" if mentioned or implied, otherwise null.`
+return {system,user}
+}
+
+async function analyzeQuery(query){
+const {system,user}=buildAnalyzePrompt(query)
+const content=await callPSModel(system,user)
+const cleaned=extractJsonBlock(content,'{','}')
+try{
+const parsed=JSON.parse(cleaned)
+return {
+count:Number.isFinite(parsed.count)?parseInt(parsed.count,10):null,
+examType:parsed.examType||null,
+subject:parsed.subject||null,
+topic:parsed.topic||null,
+chapter:parsed.chapter||null,
+keywords:Array.isArray(parsed.keywords)?parsed.keywords:[],
+difficulty:parsed.difficulty||null
+}
+}catch(e){
+return {count:null,examType:null,subject:null,topic:null,chapter:null,keywords:[],difficulty:null}
+}
+}
+
 function buildPrompt({examType,topic,subject,difficulty,batchCount,pyqText,kbText}){
 const exam=examType||'Civil Services'
 const system=`You are a senior question setter for ${exam} examinations with years of experience designing previous year papers. You generate fresh, original multiple choice questions. You never copy or lightly reword previous year questions. You use the supplied previous year questions only to learn the examiner's style, difficulty, wording pattern and framing. You use the supplied knowledge base context only as the factual source for the new questions. You always respond with strict JSON only, no markdown, no prose, no code fences.`
@@ -177,8 +253,8 @@ messages:[
 {role:'system',content:system},
 {role:'user',content:user}
 ],
-temperature:PSMODEL_TEMPERATURE,
-max_tokens:4000,
+temperature:0,
+max_tokens:800,
 stream:false
 }),
 signal:controller.signal
@@ -194,13 +270,70 @@ clearTimeout(timer)
 }
 }
 
+async function streamPSModel(system,user,onToken){
+const controller=new AbortController()
+const timer=setTimeout(()=>controller.abort(),PSMODEL_TIMEOUT_MS)
+let full=''
+try{
+const response=await fetch(PSMODEL_ENDPOINT,{
+method:'POST',
+headers:{
+'Content-Type':'application/json',
+Authorization:`Bearer ${PSMODEL_API_KEY}`
+},
+body:JSON.stringify({
+model:PSMODEL_MODEL,
+messages:[
+{role:'system',content:system},
+{role:'user',content:user}
+],
+temperature:PSMODEL_TEMPERATURE,
+max_tokens:4000,
+stream:true
+}),
+signal:controller.signal
+})
+if(!response.ok||!response.body){
+const errText=await response.text().catch(()=>'')
+throw new Error(`PSMODEL request failed with status ${response.status}: ${errText}`)
+}
+const reader=response.body.getReader()
+const decoder=new TextDecoder('utf-8')
+let buffer=''
+while(true){
+const {done,value}=await reader.read()
+if(done) break
+buffer+=decoder.decode(value,{stream:true})
+let sepIndex
+while((sepIndex=buffer.indexOf('\n\n'))!==-1){
+const rawEvent=buffer.slice(0,sepIndex)
+buffer=buffer.slice(sepIndex+2)
+const lines=rawEvent.split('\n')
+for(const line of lines){
+const trimmed=line.trim()
+if(!trimmed.startsWith('data:')) continue
+const payload=trimmed.slice(5).trim()
+if(payload==='[DONE]') continue
+try{
+const json=JSON.parse(payload)
+const delta=json?.choices?.[0]?.delta?.content
+if(delta){
+full+=delta
+if(onToken) onToken(delta)
+}
+}catch(e){}
+}
+}
+}
+return full
+}finally{
+clearTimeout(timer)
+}
+}
+
 function parseQuestionsJSON(raw){
 if(!raw) return []
-let cleaned=raw.trim()
-cleaned=cleaned.replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim()
-const start=cleaned.indexOf('[')
-const end=cleaned.lastIndexOf(']')
-if(start!==-1&&end!==-1&&end>start) cleaned=cleaned.slice(start,end+1)
+const cleaned=extractJsonBlock(raw,'[',']')
 let parsed
 try{
 parsed=JSON.parse(cleaned)
@@ -211,28 +344,14 @@ if(!Array.isArray(parsed)) return []
 return parsed.filter(q=>q&&typeof q.question==='string'&&q.options&&typeof q.options==='object')
 }
 
-async function generateBatch(params){
+async function generateBatchStreaming(params,onToken){
 for(let attempt=0;attempt<2;attempt++){
 const {system,user}=buildPrompt(params)
-const content=await callPSModel(system,user)
+const content=await streamPSModel(system,user,onToken)
 const questions=parseQuestionsJSON(content)
 if(questions.length) return questions
 }
 return []
-}
-
-async function runPool(items,concurrency,worker){
-const results=new Array(items.length)
-let cursor=0
-async function next(){
-while(cursor<items.length){
-const current=cursor++
-results[current]=await worker(items[current],current)
-}
-}
-const workers=Array.from({length:Math.min(concurrency,items.length)},()=>next())
-await Promise.all(workers)
-return results
 }
 
 async function saveGeneratedQuestions(questions,meta){
@@ -271,25 +390,54 @@ res.json({ok:true,service:'psmodel-question-generator'})
 app.get('/health',async(req,res)=>{
 try{
 const collections=await qdrant.getCollections()
-res.json({ok:true,time:new Date().toISOString(),collections:collections.collections.map(c=>c.name)})
+res.json({
+ok:true,
+time:new Date().toISOString(),
+collections:collections.collections.map(c=>c.name),
+mongo:mongoose.connection.readyState===1?'connected':'disconnected'
+})
 }catch(e){
 res.status(500).json({ok:false,error:e.message})
 }
 })
 
 app.post('/api/questions/generate',requireAdmin,async(req,res)=>{
-try{
 const body=req.body||{}
-const topic=(body.topic||'').trim()
-if(!topic) return res.status(400).json({error:'topic is required'})
-const examType=(body.examType||body.exam||'').trim()
-const subject=(body.subject||'').trim()
-const chapter=(body.chapter||'').trim()
-const difficulty=(body.difficulty||'').trim()
-const keywords=body.keywords
+const query=(body.query||'').trim()
+if(!query&&!(body.topic||'').trim()){
+return res.status(400).json({error:'query or topic is required'})
+}
+
+res.setHeader('Content-Type','text/event-stream')
+res.setHeader('Cache-Control','no-cache')
+res.setHeader('Connection','keep-alive')
+res.setHeader('X-Accel-Buffering','no')
+res.flushHeaders()
+
+function sendEvent(event,data){
+res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+}
+
+const requestId=crypto.randomUUID()
+
+try{
+const analyzed=query?await analyzeQuery(query):{count:null,examType:null,subject:null,topic:null,chapter:null,keywords:[],difficulty:null}
+
+const topic=((body.topic||analyzed.topic)||'').trim()
+if(!topic){
+sendEvent('error',{error:'Could not determine a topic from the request, please rephrase or include a topic explicitly'})
+return res.end()
+}
+const examType=((body.examType||body.exam||analyzed.examType)||'').trim()
+const subject=((body.subject||analyzed.subject)||'').trim()
+const chapter=((body.chapter||analyzed.chapter)||'').trim()
+const difficulty=((body.difficulty||analyzed.difficulty)||'').trim()
+const keywords=body.keywords||analyzed.keywords||[]
 
 let count=parseInt(body.count,10)
-if(!Number.isFinite(count)||count<=0) count=10
+if(!Number.isFinite(count)||count<=0){
+count=Number.isFinite(analyzed.count)&&analyzed.count>0?analyzed.count:10
+}
 const requestedCount=count
 count=clamp(count,1,MAX_QUESTIONS_PER_REQUEST)
 const limited=requestedCount>MAX_QUESTIONS_PER_REQUEST
@@ -305,6 +453,20 @@ searchKnowledgeBase(queryVector,KNOWLEDGE_BASE_TOP_K)
 const pyqText=formatPYQs(pyqPoints)
 const kbText=formatKnowledge(kbPoints)
 
+sendEvent('meta',{
+requestId,
+adminQuery:query||null,
+topic,
+examType:examType||null,
+subject:subject||null,
+chapter:chapter||null,
+difficulty:difficulty||null,
+requestedCount,
+limitedTo100:limited,
+pyqReferencesUsed:pyqPoints.length,
+knowledgeChunksUsed:kbPoints.length
+})
+
 const batches=[]
 let remaining=count
 while(remaining>0){
@@ -313,40 +475,68 @@ batches.push(size)
 remaining-=size
 }
 
-const requestId=crypto.randomUUID()
-const batchResults=await withTimeout(
-runPool(batches,GENERATION_CONCURRENCY,batchCount=>generateBatch({examType,topic,subject,chapter,difficulty,batchCount,pyqText,kbText})),
-PSMODEL_TIMEOUT_MS*Math.ceil(batches.length/GENERATION_CONCURRENCY)+10000,
-'question generation'
-)
+let questions=[]
+for(let b=0;b<batches.length;b++){
+const batchCount=batches[b]
+sendEvent('batch_start',{batch:b+1,totalBatches:batches.length,count:batchCount})
+const params={examType,topic,subject,chapter,difficulty,batchCount,pyqText,kbText}
+const batchQuestions=await generateBatchStreaming(params,delta=>{
+sendEvent('token',{batch:b+1,content:delta})
+})
+questions=questions.concat(batchQuestions)
+sendEvent('batch_done',{batch:b+1,totalBatches:batches.length,questions:batchQuestions})
+}
 
-let questions=batchResults.flat()
 questions=questions.slice(0,count)
 
-let saved=0
+let savedToQdrant=0
 try{
-saved=await saveGeneratedQuestions(questions,{examType,subject,topic,chapter,difficulty,requestId})
+savedToQdrant=await saveGeneratedQuestions(questions,{examType,subject,topic,chapter,difficulty,requestId})
 }catch(e){
 console.error('[saveGeneratedQuestions]',e.message)
 }
 
-res.json({
+let mongoId=null
+try{
+if(await connectMongo()){
+const doc=await ChatHistory.create({
 requestId,
-topic,
+adminQuery:query||null,
 examType:examType||null,
 subject:subject||null,
+topic,
 chapter:chapter||null,
+keywords,
+difficulty:difficulty||null,
 requestedCount,
-limitedTo100:limited,
 generatedCount:questions.length,
+limitedTo100:limited,
 pyqReferencesUsed:pyqPoints.length,
 knowledgeChunksUsed:kbPoints.length,
-savedToQdrant:saved,
+questions,
+model:PSMODEL_MODEL,
+savedToQdrant
+})
+mongoId=doc._id.toString()
+}
+}catch(e){
+console.error('[mongo save]',e.message)
+}
+
+sendEvent('done',{
+requestId,
+mongoId,
+generatedCount:questions.length,
+savedToQdrant,
 questions
 })
+res.end()
 }catch(e){
 console.error('[generate]',e)
-if(!res.headersSent) res.status(500).json({error:e.message||'Internal error'})
+try{
+sendEvent('error',{error:e.message||'Internal error'})
+}catch(_){}
+res.end()
 }
 })
 
@@ -362,6 +552,18 @@ with_payload:true,
 with_vector:false
 })
 res.json({points:result.points,nextOffset:result.next_page_offset||null})
+}catch(e){
+res.status(500).json({error:e.message||'Internal error'})
+}
+})
+
+app.post('/api/chat-history/list',requireAdmin,async(req,res)=>{
+try{
+if(!(await connectMongo())) return res.status(503).json({error:'MongoDB not configured or unavailable'})
+const body=req.body||{}
+const limit=clamp(parseInt(body.limit,10)||20,1,100)
+const docs=await ChatHistory.find({}).sort({createdAt:-1}).limit(limit).lean()
+res.json({items:docs})
 }catch(e){
 res.status(500).json({error:e.message||'Internal error'})
 }
