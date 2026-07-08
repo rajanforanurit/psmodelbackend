@@ -1,10 +1,10 @@
 {
-  "name": "psmodel-question-generator-backend",
-  "version": "1.2113.0",
-  "description": "Question generation backend using Qdrant retrieval and PSMODEL (DeepSeek-V3.2)",
+  "name": "psmodel-question-generator-model",
+  "version": "1.0.0",
+  "description": "Question generation backend using Qdrant retrieval and PSMODEL",
   "main": "index.js",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.19.0"
   },
   "scripts": {
     "start": "node index.js",
@@ -15,7 +15,8 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
-    "fastembed": "^2.1.0"
+    "fastembed": "^2.1.0",
+    "mongoose": "^9.7.4"
   },
   "devDependencies": {
     "nodemon": "^3.1.9"
