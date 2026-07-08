@@ -28,7 +28,9 @@ const QDRANT_API_KEY=process.env.QDRANT_API_KEY
 const QDRANT_QUESTION_BANK_COLLECTION=process.env.QDRANT_QUESTION_BANK_COLLECTION||'question_bank'
 const QDRANT_KNOWLEDGE_BASE_COLLECTION=process.env.QDRANT_KNOWLEDGE_BASE_COLLECTION||'knowledge_base'
 const QDRANT_GENERATED_QUESTIONS_COLLECTION=process.env.QDRANT_GENERATED_QUESTIONS_COLLECTION||'generated_questions'
+
 const ADMIN_API_KEY=process.env.ADMIN_API_KEY
+
 const PSMODEL_ENDPOINT=process.env.PSMODEL_ENDPOINT
 const PSMODEL_API_KEY=process.env.PSMODEL_API_KEY
 const PSMODEL_MODEL=process.env.PSMODEL_MODEL
@@ -71,14 +73,32 @@ savedToQdrant:Number
 const ChatHistory=mongoose.models.ChatHistory||mongoose.model('ChatHistory',chatHistorySchema,'psmodel_chat_history')
 
 let mongoConnectPromise=null
+let lastMongoError=null
+
+mongoose.connection.on('connected',()=>{
+console.log('[mongoose] connected')
+lastMongoError=null
+})
+mongoose.connection.on('error',e=>{
+console.error('[mongoose] connection error',e.message)
+lastMongoError=e.message
+})
+mongoose.connection.on('disconnected',()=>{
+console.log('[mongoose] disconnected')
+})
+
 function connectMongo(){
 if(!PSMODELCHATHISDB_URI) return Promise.resolve(false)
 if(mongoose.connection.readyState===1) return Promise.resolve(true)
 if(!mongoConnectPromise){
-mongoConnectPromise=mongoose.connect(PSMODELCHATHISDB_URI)
-.then(()=>true)
+mongoConnectPromise=mongoose.connect(PSMODELCHATHISDB_URI,{serverSelectionTimeoutMS:8000})
+.then(()=>{
+lastMongoError=null
+return true
+})
 .catch(e=>{
 console.error('[mongo connect]',e.message)
+lastMongoError=e.message
 mongoConnectPromise=null
 return false
 })
@@ -390,11 +410,14 @@ res.json({ok:true,service:'psmodel-question-generator'})
 app.get('/health',async(req,res)=>{
 try{
 const collections=await qdrant.getCollections()
+const mongoConnected=await connectMongo()
 res.json({
 ok:true,
 time:new Date().toISOString(),
 collections:collections.collections.map(c=>c.name),
-mongo:mongoose.connection.readyState===1?'connected':'disconnected'
+mongoConfigured:!!PSMODELCHATHISDB_URI,
+mongo:mongoConnected?'connected':'disconnected',
+mongoError:lastMongoError
 })
 }catch(e){
 res.status(500).json({ok:false,error:e.message})
@@ -580,6 +603,9 @@ if(!res.headersSent) res.status(500).json({error:'Unexpected error'})
 
 app.listen(PORT,()=>{
 console.log(`PSMODEL question generation backend running on port ${PORT}`)
+connectMongo().then(ok=>{
+console.log(ok?'[mongoose] initial connection succeeded':`[mongoose] initial connection failed: ${lastMongoError||'PSMODELCHATHISDB_URI not set'}`)
+})
 })
 
 module.exports=app
