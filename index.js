@@ -10,12 +10,10 @@ const {EmbeddingModel,FlagEmbedding}=require('fastembed')
 
 const app=express()
 const PORT=process.env.PORT||8080
-const ALLOWED_ORIGINS=(process.env.ALLOWED_ORIGINS||'*').split(',').map(s=>s.trim()).filter(Boolean)
+const allowedOrigins=['http://localhost:5173','http://localhost:3000','https://psmodeladmin.vercel.app']
+const originAllowed=o=>!o||o==='null'||allowedOrigins.includes(o)||/\.vercel\.app$/.test(o)
 const corsOpts={
-origin:(origin,cb)=>{
-if(!origin||ALLOWED_ORIGINS.includes('*')||ALLOWED_ORIGINS.includes(origin)) return cb(null,true)
-cb(new Error('Not allowed by CORS'))
-},
+origin:(o,cb)=>cb(null,originAllowed(o)),
 methods:['GET','POST','OPTIONS'],
 allowedHeaders:['Content-Type','Authorization','x-admin-key']
 }
