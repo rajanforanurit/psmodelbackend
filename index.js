@@ -10,10 +10,12 @@ const {EmbeddingModel,FlagEmbedding}=require('fastembed')
 
 const app=express()
 const PORT=process.env.PORT||8080
-const allowedOrigins=['http://localhost:5173','http://localhost:3000','https://psmodeladmin.vercel.app']
-const originAllowed=o=>!o||o==='null'||allowedOrigins.includes(o)||/\.vercel\.app$/.test(o)
+const ALLOWED_ORIGINS=(process.env.ALLOWED_ORIGINS||'*').split(',').map(s=>s.trim()).filter(Boolean)
 const corsOpts={
-origin:(o,cb)=>cb(null,originAllowed(o)),
+origin:(origin,cb)=>{
+if(!origin||ALLOWED_ORIGINS.includes('*')||ALLOWED_ORIGINS.includes(origin)) return cb(null,true)
+cb(new Error('Not allowed by CORS'))
+},
 methods:['GET','POST','OPTIONS'],
 allowedHeaders:['Content-Type','Authorization','x-admin-key']
 }
@@ -29,9 +31,9 @@ const QDRANT_GENERATED_QUESTIONS_COLLECTION=process.env.QDRANT_GENERATED_QUESTIO
 
 const ADMIN_API_KEY=process.env.ADMIN_API_KEY
 
-const PSMODEL_ENDPOINT=process.env.PSMODEL_ENDPOINT
+const PSMODEL_ENDPOINT=process.env.PSMODEL_ENDPOINT||'https://api.deepseek.com/chat/completions'
 const PSMODEL_API_KEY=process.env.PSMODEL_API_KEY
-const PSMODEL_MODEL=process.env.PSMODEL_MODEL
+const PSMODEL_MODEL=process.env.PSMODEL_MODEL||'deepseek-chat'
 const PSMODEL_TIMEOUT_MS=parseInt(process.env.PSMODEL_TIMEOUT_MS||'60000',10)
 const PSMODEL_TEMPERATURE=parseFloat(process.env.PSMODEL_TEMPERATURE||'0.7')
 
@@ -40,7 +42,7 @@ const PSMODELCHATHISDB_URI=process.env.PSMODELCHATHISDB_URI
 const EMBEDDING_MODEL_NAME=process.env.EMBEDDING_MODEL_NAME||'BAAI/bge-base-en-v1.5'
 const EMBEDDING_CACHE_DIR=process.env.EMBEDDING_CACHE_DIR||path.join(process.cwd(),'.fastembed_cache')
 
-const MAX_QUESTIONS_PER_REQUEST=100
+const question_limit=parseInt(process.env.QUESTION_LIMIT||'25',10)
 const QUESTION_BANK_TOP_K=parseInt(process.env.QUESTION_BANK_TOP_K||'12',10)
 const KNOWLEDGE_BASE_TOP_K=parseInt(process.env.KNOWLEDGE_BASE_TOP_K||'10',10)
 const GENERATION_BATCH_SIZE=parseInt(process.env.GENERATION_BATCH_SIZE||'10',10)
@@ -60,7 +62,8 @@ keywords:[String],
 difficulty:String,
 requestedCount:Number,
 generatedCount:Number,
-limitedTo100:Boolean,
+limitedToQuestionLimit:Boolean,
+questionLimit:Number,
 pyqReferencesUsed:Number,
 knowledgeChunksUsed:Number,
 questions:[mongoose.Schema.Types.Mixed],
@@ -401,6 +404,15 @@ await qdrant.upsert(QDRANT_GENERATED_QUESTIONS_COLLECTION,{wait:true,points:batc
 return points.length
 }
 
+async function deleteGeneratedQuestionsByRequestId(requestId){
+if(!requestId) return 0
+const result=await qdrant.delete(QDRANT_GENERATED_QUESTIONS_COLLECTION,{
+filter:{must:[{key:'request_id',match:{value:requestId}}]},
+wait:true
+})
+return result
+}
+
 app.get('/',(req,res)=>{
 res.json({ok:true,service:'psmodel-question-generator'})
 })
@@ -460,8 +472,9 @@ if(!Number.isFinite(count)||count<=0){
 count=Number.isFinite(analyzed.count)&&analyzed.count>0?analyzed.count:10
 }
 const requestedCount=count
-count=clamp(count,1,MAX_QUESTIONS_PER_REQUEST)
-const limited=requestedCount>MAX_QUESTIONS_PER_REQUEST
+count=clamp(count,1,question_limit)
+const limited=requestedCount>question_limit
+const limitMessage=limited?`Try to generate questions below ${question_limit}.`:null
 
 const searchText=buildSearchText({topic,examType,subject,chapter,keywords})
 const queryVector=await embedOne(searchText)
@@ -483,7 +496,9 @@ subject:subject||null,
 chapter:chapter||null,
 difficulty:difficulty||null,
 requestedCount,
-limitedTo100:limited,
+questionLimit:question_limit,
+limitedToQuestionLimit:limited,
+limitMessage,
 pyqReferencesUsed:pyqPoints.length,
 knowledgeChunksUsed:kbPoints.length
 })
@@ -531,7 +546,8 @@ keywords,
 difficulty:difficulty||null,
 requestedCount,
 generatedCount:questions.length,
-limitedTo100:limited,
+limitedToQuestionLimit:limited,
+questionLimit:question_limit,
 pyqReferencesUsed:pyqPoints.length,
 knowledgeChunksUsed:kbPoints.length,
 questions,
@@ -585,6 +601,28 @@ const body=req.body||{}
 const limit=clamp(parseInt(body.limit,10)||20,1,100)
 const docs=await ChatHistory.find({}).sort({createdAt:-1}).limit(limit).lean()
 res.json({items:docs})
+}catch(e){
+res.status(500).json({error:e.message||'Internal error'})
+}
+})
+
+app.post('/api/chat-history/delete',requireAdmin,async(req,res)=>{
+try{
+if(!(await connectMongo())) return res.status(503).json({error:'MongoDB not configured or unavailable'})
+const body=req.body||{}
+const id=(body.id||'').trim()
+if(!id) return res.status(400).json({error:'id is required'})
+const doc=await ChatHistory.findById(id)
+if(!doc) return res.status(404).json({error:'History item not found'})
+let qdrantDeleted=false
+try{
+await deleteGeneratedQuestionsByRequestId(doc.requestId)
+qdrantDeleted=true
+}catch(e){
+console.error('[qdrant delete]',e.message)
+}
+await ChatHistory.deleteOne({_id:id})
+res.json({deleted:true,id,requestId:doc.requestId,qdrantDeleted})
 }catch(e){
 res.status(500).json({error:e.message||'Internal error'})
 }
