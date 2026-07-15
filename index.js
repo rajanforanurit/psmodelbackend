@@ -5,6 +5,7 @@ const crypto=require('crypto')
 const express=require('express')
 const cors=require('cors')
 const mongoose=require('mongoose')
+const PDFDocument=require('pdfkit')
 const {QdrantClient}=require('@qdrant/js-client-rest')
 const {EmbeddingModel,FlagEmbedding}=require('fastembed')
 
@@ -42,10 +43,10 @@ const PSMODELCHATHISDB_URI=process.env.PSMODELCHATHISDB_URI
 const EMBEDDING_MODEL_NAME=process.env.EMBEDDING_MODEL_NAME||'BAAI/bge-base-en-v1.5'
 const EMBEDDING_CACHE_DIR=process.env.EMBEDDING_CACHE_DIR||path.join(process.cwd(),'.fastembed_cache')
 
-const question_limit=parseInt(process.env.QUESTION_LIMIT||'25',10)
+const question_limit=parseInt(process.env.QUESTION_LIMIT||'40',10)
 const QUESTION_BANK_TOP_K=parseInt(process.env.QUESTION_BANK_TOP_K||'12',10)
 const KNOWLEDGE_BASE_TOP_K=parseInt(process.env.KNOWLEDGE_BASE_TOP_K||'10',10)
-const GENERATION_BATCH_SIZE=parseInt(process.env.GENERATION_BATCH_SIZE||'10',10)
+const GENERATION_BATCH_SIZE=parseInt(process.env.GENERATION_BATCH_SIZE||'40',10)
 const SAVE_GENERATED_TO_QDRANT=process.env.SAVE_GENERATED_TO_QDRANT!=='false'
 const QDRANT_UPSERT_BATCH_SIZE=parseInt(process.env.QDRANT_UPSERT_BATCH_SIZE||'64',10)
 
@@ -145,6 +146,11 @@ next()
 
 function clamp(n,min,max){
 return Math.max(min,Math.min(max,n))
+}
+
+function sanitizeFileName(name){
+const base=(name||'questions').toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'').slice(0,60)
+return base||'questions'
 }
 
 function buildSearchText({topic,examType,subject,chapter,keywords}){
@@ -291,7 +297,7 @@ clearTimeout(timer)
 }
 }
 
-async function streamPSModel(system,user,onToken){
+async function streamPSModel(system,user,onToken,maxTokens){
 const controller=new AbortController()
 const timer=setTimeout(()=>controller.abort(),PSMODEL_TIMEOUT_MS)
 let full=''
@@ -309,7 +315,7 @@ messages:[
 {role:'user',content:user}
 ],
 temperature:PSMODEL_TEMPERATURE,
-max_tokens:4000,
+max_tokens:maxTokens||4000,
 stream:true
 }),
 signal:controller.signal
@@ -366,9 +372,10 @@ return parsed.filter(q=>q&&typeof q.question==='string'&&q.options&&typeof q.opt
 }
 
 async function generateBatchStreaming(params,onToken){
+const maxTokens=clamp(params.batchCount*220+400,1000,16000)
 for(let attempt=0;attempt<2;attempt++){
 const {system,user}=buildPrompt(params)
-const content=await streamPSModel(system,user,onToken)
+const content=await streamPSModel(system,user,onToken,maxTokens)
 const questions=parseQuestionsJSON(content)
 if(questions.length) return questions
 }
@@ -411,6 +418,42 @@ filter:{must:[{key:'request_id',match:{value:requestId}}]},
 wait:true
 })
 return result
+}
+
+function streamQuestionsPDF(res,questions,meta){
+const fileName=`psmodel_${sanitizeFileName(meta.topic)}.pdf`
+res.setHeader('Content-Type','application/pdf')
+res.setHeader('Content-Disposition',`attachment; filename="${fileName}"`)
+const doc=new PDFDocument({margin:50,size:'A4'})
+doc.pipe(res)
+doc.fontSize(18).fillColor('#000000').text(meta.topic?`Question Set: ${meta.topic}`:'Generated Questions')
+doc.moveDown(0.4)
+const metaLine=[meta.examType,meta.subject,meta.difficulty].filter(Boolean).join('   |   ')
+if(metaLine){
+doc.fontSize(10).fillColor('#555555').text(metaLine)
+doc.fillColor('#000000')
+}
+doc.moveDown()
+questions.forEach((q,i)=>{
+if(doc.y>700) doc.addPage()
+doc.fontSize(12).fillColor('#000000').text(`${i+1}. ${q.question||''}`)
+doc.moveDown(0.2)
+const opts=q.options||{}
+Object.keys(opts).sort().forEach(k=>{
+doc.fontSize(11).text(`   ${k}) ${opts[k]}`)
+})
+doc.moveDown(0.2)
+if(q.correct_answer){
+doc.fontSize(11).fillColor('#0a7d32').text(`   Correct Answer: ${q.correct_answer}`)
+doc.fillColor('#000000')
+}
+if(q.explanation){
+doc.fontSize(10).fillColor('#444444').text(`   Explanation: ${q.explanation}`)
+doc.fillColor('#000000')
+}
+doc.moveDown()
+})
+doc.end()
 }
 
 app.get('/',(req,res)=>{
@@ -525,6 +568,12 @@ sendEvent('batch_done',{batch:b+1,totalBatches:batches.length,questions:batchQue
 
 questions=questions.slice(0,count)
 
+sendEvent('done',{
+requestId,
+generatedCount:questions.length,
+questions
+})
+
 let savedToQdrant=0
 try{
 savedToQdrant=await saveGeneratedQuestions(questions,{examType,subject,topic,chapter,difficulty,requestId})
@@ -560,12 +609,10 @@ mongoId=doc._id.toString()
 console.error('[mongo save]',e.message)
 }
 
-sendEvent('done',{
+sendEvent('persisted',{
 requestId,
 mongoId,
-generatedCount:questions.length,
-savedToQdrant,
-questions
+savedToQdrant
 })
 res.end()
 }catch(e){
@@ -591,6 +638,54 @@ with_vector:false
 res.json({points:result.points,nextOffset:result.next_page_offset||null})
 }catch(e){
 res.status(500).json({error:e.message||'Internal error'})
+}
+})
+
+app.post('/api/questions/pdf',requireAdmin,async(req,res)=>{
+try{
+const body=req.body||{}
+let questions=Array.isArray(body.questions)?body.questions:null
+let meta={topic:body.topic||null,examType:body.examType||null,subject:body.subject||null,difficulty:body.difficulty||null}
+
+if(!questions&&body.requestId){
+if(await connectMongo()){
+const doc=await ChatHistory.findOne({requestId:body.requestId}).lean()
+if(doc){
+questions=doc.questions||[]
+meta={topic:doc.topic,examType:doc.examType,subject:doc.subject,difficulty:doc.difficulty}
+}
+}
+if(!questions||!questions.length){
+const result=await qdrant.scroll(QDRANT_GENERATED_QUESTIONS_COLLECTION,{
+filter:{must:[{key:'request_id',match:{value:body.requestId}}]},
+limit:200,
+with_payload:true,
+with_vector:false
+})
+const points=result.points||[]
+if(points.length){
+questions=points.map(p=>({
+question:p.payload.question,
+options:p.payload.options,
+correct_answer:p.payload.correct_answer,
+explanation:p.payload.explanation,
+difficulty:p.payload.difficulty,
+topic:p.payload.topic,
+subject:p.payload.subject
+}))
+meta.topic=meta.topic||points[0].payload.topic
+meta.examType=meta.examType||points[0].payload.exam
+meta.subject=meta.subject||points[0].payload.subject
+meta.difficulty=meta.difficulty||points[0].payload.difficulty
+}
+}
+}
+
+if(!questions||!questions.length) return res.status(404).json({error:'No questions found to export'})
+streamQuestionsPDF(res,questions,meta)
+}catch(e){
+if(!res.headersSent) res.status(500).json({error:e.message||'Internal error'})
+else res.end()
 }
 })
 
