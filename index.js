@@ -246,7 +246,7 @@ return {count:null,examType:null,subject:null,topic:null,chapter:null,keywords:[
 
 function buildPrompt({examType,topic,subject,difficulty,batchCount,pyqText,kbText}){
 const exam=examType||'Civil Services'
-const system=`You are a senior question setter for ${exam} examinations with years of experience designing previous year papers. You generate fresh, original multiple choice questions. You never copy or lightly reword previous year questions. You use the supplied previous year questions only to learn the examiner's style, difficulty, wording pattern and framing. You use the supplied knowledge base context only as the factual source for the new questions. You always respond with strict JSON only, no markdown, no prose, no code fences.`
+const system=`You are a senior question setter for ${exam} examinations with years of experience designing previous year papers. You generate fresh, original multiple choice questions. You never copy or lightly reword previous year questions. You use the supplied previous year questions only to learn the examiner's style, difficulty, wording pattern and framing. You use the supplied knowledge base context only as the factual source for the new questions. Write each explanation as a direct, self-contained statement of fact. Never begin an explanation with a meta-phrase such as "As per the knowledge," "Based on the provided context," "According to the source," or similar attribution; state the fact itself. You always respond with strict JSON only, no markdown, no prose, no code fences.`
 const user=`Topic: ${topic}
 Subject: ${subject||'General Studies'}
 Exam: ${exam}
