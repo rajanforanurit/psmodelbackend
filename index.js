@@ -32,6 +32,9 @@ const QDRANT_GENERATED_QUESTIONS_COLLECTION=process.env.QDRANT_GENERATED_QUESTIO
 
 const ADMIN_API_KEY=process.env.ADMIN_API_KEY
 
+// PSMODEL_MODEL should point at an explicit, versioned model string from your provider's
+// dashboard (e.g. DeepSeek). Aliases like "deepseek-chat" can be silently repointed by the
+// provider to a newer generation model, so pin explicitly if you need consistent behavior.
 const PSMODEL_ENDPOINT=process.env.PSMODEL_ENDPOINT||'https://api.deepseek.com/chat/completions'
 const PSMODEL_API_KEY=process.env.PSMODEL_API_KEY
 const PSMODEL_MODEL=process.env.PSMODEL_MODEL||'deepseek-chat'
@@ -43,10 +46,15 @@ const PSMODELCHATHISDB_URI=process.env.PSMODELCHATHISDB_URI
 const EMBEDDING_MODEL_NAME=process.env.EMBEDDING_MODEL_NAME||'BAAI/bge-base-en-v1.5'
 const EMBEDDING_CACHE_DIR=process.env.EMBEDDING_CACHE_DIR||path.join(process.cwd(),'.fastembed_cache')
 
-const question_limit=parseInt(process.env.QUESTION_LIMIT||'40',10)
+// question_limit is now a TOTAL cap across every topic in a single request (not per-topic).
+const question_limit=parseInt(process.env.QUESTION_LIMIT||'100',10)
+// Max number of distinct topics/subjects allowed in one request, to keep latency/cost sane.
+const MAX_TOPICS=parseInt(process.env.MAX_TOPICS||'8',10)
 const QUESTION_BANK_TOP_K=parseInt(process.env.QUESTION_BANK_TOP_K||'12',10)
 const KNOWLEDGE_BASE_TOP_K=parseInt(process.env.KNOWLEDGE_BASE_TOP_K||'10',10)
-const GENERATION_BATCH_SIZE=parseInt(process.env.GENERATION_BATCH_SIZE||'40',10)
+// Smaller batches = more reliable JSON per call. This is what makes generating 70-100+
+// questions per request actually work, instead of asking the model for everything at once.
+const GENERATION_BATCH_SIZE=parseInt(process.env.GENERATION_BATCH_SIZE||'15',10)
 const SAVE_GENERATED_TO_QDRANT=process.env.SAVE_GENERATED_TO_QDRANT!=='false'
 const QDRANT_UPSERT_BATCH_SIZE=parseInt(process.env.QDRANT_UPSERT_BATCH_SIZE||'64',10)
 
@@ -55,12 +63,15 @@ const qdrant=new QdrantClient({url:QDRANT_URL,apiKey:QDRANT_API_KEY})
 const chatHistorySchema=new mongoose.Schema({
 requestId:{type:String,index:true},
 adminQuery:String,
+// Deprecated single-topic fields, kept populated (from the first topic) for backward compatibility.
 examType:String,
 subject:String,
 topic:String,
 chapter:String,
 keywords:[String],
 difficulty:String,
+// New multi-topic breakdown.
+topics:[mongoose.Schema.Types.Mixed],
 requestedCount:Number,
 generatedCount:Number,
 limitedToQuestionLimit:Boolean,
@@ -206,22 +217,40 @@ if(start!==-1&&end!==-1&&end>start) cleaned=cleaned.slice(start,end+1)
 return cleaned
 }
 
+// ---- Multi-topic intent extraction ----
+// The admin can now ask for several topics/subjects/difficulties in one message, e.g.
+// "30 Polity questions on Fundamental Rights and 20 tough Geography questions on monsoons".
+// The model returns an array of independent topic "requests" instead of a single object.
 function buildAnalyzePrompt(query){
-const system='You are an intent extraction engine for a Civil Services exam question generation system. Extract structured parameters from the admin natural language request. Always respond with strict JSON only, no markdown, no prose, no code fences.'
+const system='You are an intent extraction engine for a Civil Services exam question generation system. Extract structured parameters from the admin natural language request. The request may cover ONE topic or MULTIPLE distinct topics/subjects/difficulty levels in the same message. Always respond with strict JSON only, no markdown, no prose, no code fences.'
 const user=`Admin request: "${query}"
 
 Return ONLY a JSON object in this exact shape:
-{"count":null,"examType":null,"subject":null,"topic":null,"chapter":null,"keywords":[],"difficulty":null}
+{"requests":[{"count":null,"examType":null,"subject":null,"topic":null,"chapter":null,"keywords":[],"difficulty":null}]}
 
 Rules:
-count is the integer number of questions requested, or null if not mentioned.
-examType is the exam name and stage if mentioned, for example "UPSC Prelims", "BPSC", "State PSC Mains", or null.
-topic is the specific topic the questions should be about.
+Create ONE object per distinct topic/subject/difficulty combination the admin asked for. If only one topic is mentioned, return an array with exactly one object.
+count is the integer number of questions requested for that specific topic, or null if not mentioned or if only a single combined total was given for multiple topics.
+examType is the exam name and stage if mentioned, for example "UPSC Prelims", "BPSC", "State PSC Mains", or null. If mentioned once for the whole request, repeat it on every object.
+topic is the specific topic those questions should be about.
 chapter is the book chapter or syllabus section if identifiable, otherwise same as topic or null.
 subject is the broader subject area such as Polity, History, Geography, Economy, Science, Environment or Current Affairs, inferred from the topic if not explicit.
-keywords is an array of related search terms derived from the request.
-difficulty is "Easy", "Moderate" or "Difficult" if mentioned or implied, otherwise null.`
+keywords is an array of related search terms derived from the request for that topic.
+difficulty is "Easy", "Moderate" or "Difficult" if mentioned or implied for that topic, otherwise null.
+Never merge two clearly different topics into one object.`
 return {system,user}
+}
+
+function normalizeSpec(raw){
+return {
+count:Number.isFinite(raw.count)?parseInt(raw.count,10):null,
+examType:raw.examType||null,
+subject:raw.subject||null,
+topic:raw.topic||null,
+chapter:raw.chapter||null,
+keywords:Array.isArray(raw.keywords)?raw.keywords:[],
+difficulty:raw.difficulty||null
+}
 }
 
 async function analyzeQuery(query){
@@ -230,18 +259,75 @@ const content=await callPSModel(system,user)
 const cleaned=extractJsonBlock(content,'{','}')
 try{
 const parsed=JSON.parse(cleaned)
-return {
-count:Number.isFinite(parsed.count)?parseInt(parsed.count,10):null,
-examType:parsed.examType||null,
-subject:parsed.subject||null,
-topic:parsed.topic||null,
-chapter:parsed.chapter||null,
-keywords:Array.isArray(parsed.keywords)?parsed.keywords:[],
-difficulty:parsed.difficulty||null
+let requests=Array.isArray(parsed.requests)?parsed.requests:null
+if(!requests){
+// Backward-compatible fallback in case the model returns the old flat shape.
+if(parsed.topic||parsed.subject) requests=[parsed]
 }
+if(!requests||!requests.length) return []
+return requests.map(normalizeSpec).filter(s=>s.topic)
 }catch(e){
-return {count:null,examType:null,subject:null,topic:null,chapter:null,keywords:[],difficulty:null}
+return []
 }
+}
+
+// Merge per-spec fields with request-level fallbacks (body-level overrides apply to every topic
+// unless that topic already specified its own value).
+function applyFallbacks(spec,fallback){
+return {
+count:spec.count,
+examType:spec.examType||fallback.examType||null,
+subject:spec.subject||fallback.subject||null,
+topic:spec.topic,
+chapter:spec.chapter||fallback.chapter||null,
+keywords:(spec.keywords&&spec.keywords.length)?spec.keywords:(fallback.keywords||[]),
+difficulty:spec.difficulty||fallback.difficulty||null
+}
+}
+
+// Resolve how many questions each topic should get before the overall limit is applied.
+function resolveSpecCounts(specs,bodyCount){
+const anySpecHasCount=specs.some(s=>Number.isFinite(s.count)&&s.count>0)
+if(specs.length===1){
+const c=Number.isFinite(bodyCount)&&bodyCount>0?bodyCount:(Number.isFinite(specs[0].count)&&specs[0].count>0?specs[0].count:10)
+specs[0].requestedCount=c
+return specs
+}
+if(anySpecHasCount){
+specs.forEach(s=>{
+s.requestedCount=Number.isFinite(s.count)&&s.count>0?s.count:10
+})
+return specs
+}
+const total=Number.isFinite(bodyCount)&&bodyCount>0?bodyCount:specs.length*10
+const base=Math.floor(total/specs.length)
+let remainder=total-base*specs.length
+specs.forEach(s=>{
+s.requestedCount=base+(remainder>0?1:0)
+if(remainder>0) remainder--
+})
+return specs
+}
+
+// Apply the overall QUESTION_LIMIT across all topics combined, scaling proportionally if needed.
+function applyOverallLimit(specs,limit){
+const totalRequested=specs.reduce((a,s)=>a+s.requestedCount,0)
+if(totalRequested<=limit){
+specs.forEach(s=>{s.count=s.requestedCount})
+return {limited:false,totalRequested,totalCount:totalRequested}
+}
+const scaled=specs.map(s=>Math.max(1,Math.floor(s.requestedCount*limit/totalRequested)))
+let sum=scaled.reduce((a,b)=>a+b,0)
+let diff=limit-sum
+let i=0
+while(diff!==0&&specs.length>0&&i<10000){
+const idx=i%specs.length
+if(diff>0){scaled[idx]++;diff--}
+else if(scaled[idx]>1){scaled[idx]--;diff++}
+i++
+}
+specs.forEach((s,idx)=>{s.count=scaled[idx]})
+return {limited:true,totalRequested,totalCount:scaled.reduce((a,b)=>a+b,0)}
 }
 
 function buildPrompt({examType,topic,subject,difficulty,batchCount,pyqText,kbText}){
@@ -382,6 +468,69 @@ if(questions.length) return questions
 return []
 }
 
+// Generates all questions for a single topic spec, in batches of GENERATION_BATCH_SIZE,
+// emitting SSE progress events along the way.
+async function generateForTopic(spec,sendEvent,topicIndex,totalTopics){
+const searchText=buildSearchText(spec)
+const queryVector=await embedOne(searchText)
+
+const [pyqPoints,kbPoints]=await Promise.all([
+searchQuestionBank(queryVector,QUESTION_BANK_TOP_K),
+searchKnowledgeBase(queryVector,KNOWLEDGE_BASE_TOP_K)
+])
+
+const pyqText=formatPYQs(pyqPoints)
+const kbText=formatKnowledge(kbPoints)
+
+sendEvent('topic_start',{
+topicIndex,
+totalTopics,
+topic:spec.topic,
+subject:spec.subject,
+examType:spec.examType,
+difficulty:spec.difficulty,
+requestedCount:spec.requestedCount,
+count:spec.count,
+pyqReferencesUsed:pyqPoints.length,
+knowledgeChunksUsed:kbPoints.length
+})
+
+const batches=[]
+let remaining=spec.count
+while(remaining>0){
+const size=Math.min(GENERATION_BATCH_SIZE,remaining)
+batches.push(size)
+remaining-=size
+}
+
+let questions=[]
+for(let b=0;b<batches.length;b++){
+const batchCount=batches[b]
+sendEvent('batch_start',{topicIndex,totalTopics,topic:spec.topic,batch:b+1,totalBatches:batches.length,count:batchCount})
+const params={examType:spec.examType,topic:spec.topic,subject:spec.subject,chapter:spec.chapter,difficulty:spec.difficulty,batchCount,pyqText,kbText}
+const batchQuestions=await generateBatchStreaming(params,delta=>{
+sendEvent('token',{topicIndex,totalTopics,topic:spec.topic,batch:b+1,content:delta})
+})
+questions=questions.concat(batchQuestions)
+sendEvent('batch_done',{topicIndex,totalTopics,topic:spec.topic,batch:b+1,totalBatches:batches.length,questions:batchQuestions})
+}
+
+questions=questions.slice(0,spec.count).map(q=>({
+...q,
+topic:q.topic||spec.topic,
+subject:q.subject||spec.subject||null
+}))
+
+sendEvent('topic_done',{
+topicIndex,
+totalTopics,
+topic:spec.topic,
+generatedCount:questions.length
+})
+
+return {spec,questions,pyqReferencesUsed:pyqPoints.length,knowledgeChunksUsed:kbPoints.length}
+}
+
 async function saveGeneratedQuestions(questions,meta){
 if(!SAVE_GENERATED_TO_QDRANT||!questions.length) return 0
 const texts=questions.map(q=>[q.question,...Object.values(q.options||{})].join(' '))
@@ -390,10 +539,10 @@ const points=questions.map((q,i)=>({
 id:crypto.randomUUID(),
 vector:vectors[i],
 payload:{
-exam:meta.examType||null,
+exam:q.examType||meta.examType||null,
 subject:q.subject||meta.subject||null,
 topic:q.topic||meta.topic,
-chapter:meta.chapter||null,
+chapter:q.chapter||meta.chapter||null,
 question:q.question,
 options:q.options,
 correct_answer:q.correct_answer||null,
@@ -434,9 +583,14 @@ doc.fontSize(10).fillColor('#555555').text(metaLine)
 doc.fillColor('#000000')
 }
 doc.moveDown()
+const multiTopic=meta.multiTopic
 questions.forEach((q,i)=>{
 if(doc.y>700) doc.addPage()
 doc.fontSize(12).fillColor('#000000').text(`${i+1}. ${q.question||''}`)
+if(multiTopic&&(q.topic||q.subject)){
+doc.fontSize(9).fillColor('#777777').text(`   ${[q.subject,q.topic].filter(Boolean).join(' / ')}`)
+doc.fillColor('#000000')
+}
 doc.moveDown(0.2)
 const opts=q.options||{}
 Object.keys(opts).sort().forEach(k=>{
@@ -470,7 +624,10 @@ time:new Date().toISOString(),
 collections:collections.collections.map(c=>c.name),
 mongoConfigured:!!PSMODELCHATHISDB_URI,
 mongo:mongoConnected?'connected':'disconnected',
-mongoError:lastMongoError
+mongoError:lastMongoError,
+questionLimit:question_limit,
+maxTopics:MAX_TOPICS,
+generationBatchSize:GENERATION_BATCH_SIZE
 })
 }catch(e){
 res.status(500).json({ok:false,error:e.message})
@@ -480,8 +637,12 @@ res.status(500).json({ok:false,error:e.message})
 app.post('/api/questions/generate',requireAdmin,async(req,res)=>{
 const body=req.body||{}
 const query=(body.query||'').trim()
-if(!query&&!(body.topic||'').trim()){
-return res.status(400).json({error:'query or topic is required'})
+
+// Explicit per-topic overrides from the client take priority over NL parsing.
+const explicitTopics=Array.isArray(body.topics)?body.topics.map(normalizeSpec).filter(s=>s.topic):null
+
+if(!query&&!(body.topic||'').trim()&&!(explicitTopics&&explicitTopics.length)){
+return res.status(400).json({error:'query, topic, or topics is required'})
 }
 
 res.setHeader('Content-Type','text/event-stream')
@@ -497,86 +658,88 @@ res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
 const requestId=crypto.randomUUID()
 
 try{
-const analyzed=query?await analyzeQuery(query):{count:null,examType:null,subject:null,topic:null,chapter:null,keywords:[],difficulty:null}
+let specs=explicitTopics&&explicitTopics.length?explicitTopics:null
 
-const topic=((body.topic||analyzed.topic)||'').trim()
-if(!topic){
+if(!specs){
+if(query){
+specs=await analyzeQuery(query)
+}
+if((!specs||!specs.length)&&(body.topic||'').trim()){
+specs=[normalizeSpec({
+topic:(body.topic||'').trim(),
+examType:body.examType||body.exam||null,
+subject:body.subject||null,
+chapter:body.chapter||null,
+keywords:body.keywords||[],
+difficulty:body.difficulty||null,
+count:Number.isFinite(parseInt(body.count,10))?parseInt(body.count,10):null
+})]
+}
+}
+
+if(!specs||!specs.length){
 sendEvent('error',{error:'Could not determine a topic from the request, please rephrase or include a topic explicitly'})
 return res.end()
 }
-const examType=((body.examType||body.exam||analyzed.examType)||'').trim()
-const subject=((body.subject||analyzed.subject)||'').trim()
-const chapter=((body.chapter||analyzed.chapter)||'').trim()
-const difficulty=((body.difficulty||analyzed.difficulty)||'').trim()
-const keywords=body.keywords||analyzed.keywords||[]
 
-let count=parseInt(body.count,10)
-if(!Number.isFinite(count)||count<=0){
-count=Number.isFinite(analyzed.count)&&analyzed.count>0?analyzed.count:10
+if(specs.length>MAX_TOPICS){
+specs=specs.slice(0,MAX_TOPICS)
 }
-const requestedCount=count
-count=clamp(count,1,question_limit)
-const limited=requestedCount>question_limit
-const limitMessage=limited?`Try to generate questions below ${question_limit}.`:null
 
-const searchText=buildSearchText({topic,examType,subject,chapter,keywords})
-const queryVector=await embedOne(searchText)
+const globalFallback={
+examType:(body.examType||body.exam||'').trim()||null,
+subject:(body.subject||'').trim()||null,
+chapter:(body.chapter||'').trim()||null,
+difficulty:(body.difficulty||'').trim()||null,
+keywords:body.keywords||[]
+}
+specs=specs.map(s=>applyFallbacks(s,globalFallback))
 
-const [pyqPoints,kbPoints]=await Promise.all([
-searchQuestionBank(queryVector,QUESTION_BANK_TOP_K),
-searchKnowledgeBase(queryVector,KNOWLEDGE_BASE_TOP_K)
-])
+const bodyCount=parseInt(body.count,10)
+specs=resolveSpecCounts(specs,Number.isFinite(bodyCount)?bodyCount:null)
 
-const pyqText=formatPYQs(pyqPoints)
-const kbText=formatKnowledge(kbPoints)
+const {limited,totalRequested,totalCount}=applyOverallLimit(specs,question_limit)
+const limitMessage=limited?`Total questions requested (${totalRequested}) exceeded the limit of ${question_limit} and were scaled down proportionally across topics.`:null
 
 sendEvent('meta',{
 requestId,
 adminQuery:query||null,
-topic,
-examType:examType||null,
-subject:subject||null,
-chapter:chapter||null,
-difficulty:difficulty||null,
-requestedCount,
+topics:specs.map(s=>({
+topic:s.topic,
+examType:s.examType,
+subject:s.subject,
+chapter:s.chapter,
+difficulty:s.difficulty,
+requestedCount:s.requestedCount,
+count:s.count
+})),
+totalTopics:specs.length,
 questionLimit:question_limit,
+requestedCount:totalRequested,
 limitedToQuestionLimit:limited,
-limitMessage,
-pyqReferencesUsed:pyqPoints.length,
-knowledgeChunksUsed:kbPoints.length
+limitMessage
 })
 
-const batches=[]
-let remaining=count
-while(remaining>0){
-const size=Math.min(GENERATION_BATCH_SIZE,remaining)
-batches.push(size)
-remaining-=size
+const results=[]
+for(let t=0;t<specs.length;t++){
+const result=await generateForTopic(specs[t],sendEvent,t+1,specs.length)
+results.push(result)
 }
 
-let questions=[]
-for(let b=0;b<batches.length;b++){
-const batchCount=batches[b]
-sendEvent('batch_start',{batch:b+1,totalBatches:batches.length,count:batchCount})
-const params={examType,topic,subject,chapter,difficulty,batchCount,pyqText,kbText}
-const batchQuestions=await generateBatchStreaming(params,delta=>{
-sendEvent('token',{batch:b+1,content:delta})
-})
-questions=questions.concat(batchQuestions)
-sendEvent('batch_done',{batch:b+1,totalBatches:batches.length,questions:batchQuestions})
-}
-
-questions=questions.slice(0,count)
+let questions=results.flatMap(r=>r.questions)
+const pyqReferencesUsed=results.reduce((a,r)=>a+r.pyqReferencesUsed,0)
+const knowledgeChunksUsed=results.reduce((a,r)=>a+r.knowledgeChunksUsed,0)
 
 sendEvent('done',{
 requestId,
 generatedCount:questions.length,
+totalTopics:specs.length,
 questions
 })
 
 let savedToQdrant=0
 try{
-savedToQdrant=await saveGeneratedQuestions(questions,{examType,subject,topic,chapter,difficulty,requestId})
+savedToQdrant=await saveGeneratedQuestions(questions,{requestId,examType:specs[0].examType,subject:specs[0].subject,topic:specs[0].topic,chapter:specs[0].chapter,difficulty:specs[0].difficulty})
 }catch(e){
 console.error('[saveGeneratedQuestions]',e.message)
 }
@@ -584,21 +747,33 @@ console.error('[saveGeneratedQuestions]',e.message)
 let mongoId=null
 try{
 if(await connectMongo()){
+const first=specs[0]
 const doc=await ChatHistory.create({
 requestId,
 adminQuery:query||null,
-examType:examType||null,
-subject:subject||null,
-topic,
-chapter:chapter||null,
-keywords,
-difficulty:difficulty||null,
-requestedCount,
+examType:first.examType||null,
+subject:first.subject||null,
+topic:first.topic,
+chapter:first.chapter||null,
+keywords:first.keywords||[],
+difficulty:first.difficulty||null,
+topics:specs.map((s,i)=>({
+topic:s.topic,
+examType:s.examType,
+subject:s.subject,
+chapter:s.chapter,
+difficulty:s.difficulty,
+keywords:s.keywords,
+requestedCount:s.requestedCount,
+count:s.count,
+generatedCount:results[i]?results[i].questions.length:0
+})),
+requestedCount:totalRequested,
 generatedCount:questions.length,
 limitedToQuestionLimit:limited,
 questionLimit:question_limit,
-pyqReferencesUsed:pyqPoints.length,
-knowledgeChunksUsed:kbPoints.length,
+pyqReferencesUsed,
+knowledgeChunksUsed,
 questions,
 model:PSMODEL_MODEL,
 savedToQdrant
@@ -652,13 +827,20 @@ if(await connectMongo()){
 const doc=await ChatHistory.findOne({requestId:body.requestId}).lean()
 if(doc){
 questions=doc.questions||[]
-meta={topic:doc.topic,examType:doc.examType,subject:doc.subject,difficulty:doc.difficulty}
+const topicList=Array.isArray(doc.topics)?doc.topics.map(t=>t.topic).filter(Boolean):[]
+meta={
+topic:topicList.length>1?topicList.join(', '):doc.topic,
+examType:doc.examType,
+subject:topicList.length>1?null:doc.subject,
+difficulty:topicList.length>1?null:doc.difficulty,
+multiTopic:topicList.length>1
+}
 }
 }
 if(!questions||!questions.length){
 const result=await qdrant.scroll(QDRANT_GENERATED_QUESTIONS_COLLECTION,{
 filter:{must:[{key:'request_id',match:{value:body.requestId}}]},
-limit:200,
+limit:500,
 with_payload:true,
 with_vector:false
 })
@@ -673,10 +855,12 @@ difficulty:p.payload.difficulty,
 topic:p.payload.topic,
 subject:p.payload.subject
 }))
-meta.topic=meta.topic||points[0].payload.topic
+const distinctTopics=[...new Set(points.map(p=>p.payload.topic).filter(Boolean))]
+meta.topic=meta.topic||(distinctTopics.length>1?distinctTopics.join(', '):distinctTopics[0])
 meta.examType=meta.examType||points[0].payload.exam
-meta.subject=meta.subject||points[0].payload.subject
-meta.difficulty=meta.difficulty||points[0].payload.difficulty
+meta.subject=meta.subject||(distinctTopics.length>1?null:points[0].payload.subject)
+meta.difficulty=meta.difficulty||(distinctTopics.length>1?null:points[0].payload.difficulty)
+meta.multiTopic=meta.multiTopic||distinctTopics.length>1
 }
 }
 }
