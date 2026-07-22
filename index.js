@@ -52,9 +52,12 @@ const question_limit=parseInt(process.env.QUESTION_LIMIT||'100',10)
 const MAX_TOPICS=parseInt(process.env.MAX_TOPICS||'8',10)
 const QUESTION_BANK_TOP_K=parseInt(process.env.QUESTION_BANK_TOP_K||'12',10)
 const KNOWLEDGE_BASE_TOP_K=parseInt(process.env.KNOWLEDGE_BASE_TOP_K||'10',10)
-// Smaller batches = more reliable JSON per call. This is what makes generating 70-100+
-// questions per request actually work, instead of asking the model for everything at once.
-const GENERATION_BATCH_SIZE=parseInt(process.env.GENERATION_BATCH_SIZE||'15',10)
+// Batches are NDJSON (one question per line) with per-line parsing and shortfall-only retries,
+// so a broken/truncated line no longer costs you the whole batch. That makes larger batches safe.
+const GENERATION_BATCH_SIZE=parseInt(process.env.GENERATION_BATCH_SIZE||'25',10)
+// How many topics run concurrently in a multi-topic request. Independent topics don't need to
+// wait on each other; keep this modest to stay under your PSMODEL provider's rate limits.
+const TOPIC_CONCURRENCY=parseInt(process.env.TOPIC_CONCURRENCY||'2',10)
 const SAVE_GENERATED_TO_QDRANT=process.env.SAVE_GENERATED_TO_QDRANT!=='false'
 const QDRANT_UPSERT_BATCH_SIZE=parseInt(process.env.QDRANT_UPSERT_BATCH_SIZE||'64',10)
 
@@ -330,23 +333,27 @@ specs.forEach((s,idx)=>{s.count=scaled[idx]})
 return {limited:true,totalRequested,totalCount:scaled.reduce((a,b)=>a+b,0)}
 }
 
-function buildPrompt({examType,topic,subject,difficulty,batchCount,pyqText,kbText}){
+// NDJSON instead of a JSON array: one object per line. This means a truncated stream or one
+// malformed line only costs that line, not the entire batch — the accumulator below parses
+// and accepts lines as they complete, independent of whatever comes after them.
+function buildPrompt({examType,topic,subject,difficulty,batchCount,pyqText,kbText,avoidList}){
 const exam=examType||'Civil Services'
-const system=`You are a senior question setter for ${exam} examinations with years of experience designing previous year papers. You generate fresh, original multiple choice questions. You never copy or lightly reword previous year questions. You use the supplied previous year questions only to learn the examiner's style, difficulty, wording pattern and framing. You use the supplied knowledge base context only as the factual source for the new questions. Write each explanation as a direct, self-contained statement of fact. Never begin an explanation with a meta-phrase such as "As per the knowledge," "Based on the provided context," "According to the source," or similar attribution; state the fact itself. You always respond with strict JSON only, no markdown, no prose, no code fences.`
+const system=`You are a senior ${exam} question setter. Write fresh, original MCQs — never copy or lightly reword the sample previous-year questions below; use them only to match style, tone and difficulty. Use the knowledge base text as the sole factual source. Write each explanation as a direct, self-contained statement of fact — never open with a meta-phrase like "As per the knowledge," "Based on the provided context," or "According to the source." Output NDJSON only: exactly one valid JSON object per line, no surrounding array brackets, no commas between lines, no blank lines, no markdown, no code fences, no numbering, no text before or after the lines.`
+
+const avoidBlock=(avoidList&&avoidList.length)?`\nDo not repeat or closely rephrase any of these already-used question stems:\n${avoidList.map(s=>`- ${s}`).join('\n')}\n`:''
+
 const user=`Topic: ${topic}
 Subject: ${subject||'General Studies'}
 Exam: ${exam}
 Difficulty: ${difficulty||'Moderate, matching the exam standard'}
-Generate exactly ${batchCount} new original MCQs.
-
-Previous year questions for style, pattern and difficulty reference only:
+Generate exactly ${batchCount} new original MCQs. Output exactly ${batchCount} lines, each a standalone JSON object in this shape:
+{"question":"...","options":{"A":"...","B":"...","C":"...","D":"..."},"correct_answer":"A","explanation":"...","difficulty":"Easy|Moderate|Difficult","topic":"${topic}","subject":"${subject||''}"}
+${avoidBlock}
+Previous year questions (style/pattern/difficulty reference only, do not copy):
 ${pyqText}
 
-Knowledge base context to use as the factual source for new questions:
-${kbText}
-
-Return ONLY a JSON array with exactly ${batchCount} objects in this exact shape, and nothing else:
-[{"question":"...","options":{"A":"...","B":"...","C":"...","D":"..."},"correct_answer":"A","explanation":"...","difficulty":"Easy|Moderate|Difficult","topic":"${topic}","subject":"${subject||''}"}]`
+Knowledge base context (factual source for new questions):
+${kbText}`
 return {system,user}
 }
 
@@ -444,33 +451,109 @@ clearTimeout(timer)
 }
 }
 
-function parseQuestionsJSON(raw){
-if(!raw) return []
-const cleaned=extractJsonBlock(raw,'[',']')
-let parsed
-try{
-parsed=JSON.parse(cleaned)
-}catch(e){
-return []
+// Parses a single NDJSON line into a question object, tolerating a stray trailing comma or
+// accidental code-fence/array-bracket noise the model might still slip in.
+function parseQuestionLine(line){
+let cleaned=(line||'').trim()
+if(!cleaned) return null
+cleaned=cleaned.replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim()
+cleaned=cleaned.replace(/,\s*$/,'')
+if(!cleaned.startsWith('{')){
+const s=cleaned.indexOf('{')
+const e=cleaned.lastIndexOf('}')
+if(s===-1||e===-1||e<=s) return null
+cleaned=cleaned.slice(s,e+1)
 }
-if(!Array.isArray(parsed)) return []
-return parsed.filter(q=>q&&typeof q.question==='string'&&q.options&&typeof q.options==='object')
+try{
+const obj=JSON.parse(cleaned)
+if(obj&&typeof obj.question==='string'&&obj.question.trim()&&obj.options&&typeof obj.options==='object') return obj
+return null
+}catch(e){
+return null
+}
 }
 
-async function generateBatchStreaming(params,onToken){
-const maxTokens=clamp(params.batchCount*220+400,1000,16000)
-for(let attempt=0;attempt<2;attempt++){
-const {system,user}=buildPrompt(params)
-const content=await streamPSModel(system,user,onToken,maxTokens)
-const questions=parseQuestionsJSON(content)
-if(questions.length) return questions
+// Normalizes a question stem for duplicate detection: lowercase, strip punctuation, collapse
+// whitespace. Doesn't need to be perfect — it only needs to catch near-identical repeats.
+function normalizeStem(text){
+return (text||'').toLowerCase().replace(/[^a-z0-9\s]/g,'').replace(/\s+/g,' ').trim().slice(0,120)
 }
-return []
+
+// Buffers streamed token deltas and emits complete lines to onLine as soon as a newline
+// arrives, so questions can be accepted (and even shown to the user) mid-stream instead of
+// only after the whole batch finishes.
+function createLineAccumulator(onLine){
+let buffer=''
+return {
+push(delta){
+buffer+=delta
+let idx
+while((idx=buffer.indexOf('\n'))!==-1){
+const line=buffer.slice(0,idx)
+buffer=buffer.slice(idx+1)
+if(line.trim()) onLine(line)
+}
+},
+flush(){
+if(buffer.trim()) onLine(buffer)
+buffer=''
+}
+}
+}
+
+// Generates exactly params.batchCount NEW (non-duplicate) questions for one batch, retrying
+// only the shortfall (not the whole batch) up to 2 extra times if lines were dropped, invalid,
+// or duplicates. dedupState is shared across the whole request (all topics, all batches).
+async function generateQuestionsForBatch(params,dedupState,onQuestion){
+let stillNeeded=params.batchCount
+let collected=[]
+for(let attempt=0;attempt<3&&stillNeeded>0;attempt++){
+const avoidList=dedupState.recentTexts.slice(-20)
+const passParams={...params,batchCount:stillNeeded,avoidList}
+const maxTokens=clamp(stillNeeded*230+300,600,16000)
+const {system,user}=buildPrompt(passParams)
+const acc=createLineAccumulator(line=>{
+const q=parseQuestionLine(line)
+if(!q) return
+const stem=normalizeStem(q.question)
+if(dedupState.seen.has(stem)) return
+dedupState.seen.add(stem)
+dedupState.recentTexts.push(q.question.slice(0,140))
+collected.push(q)
+if(onQuestion) onQuestion(q)
+})
+try{
+await streamPSModel(system,user,delta=>acc.push(delta),maxTokens)
+}catch(e){
+// fall through to flush whatever was collected before the error, then retry the shortfall
+}
+acc.flush()
+stillNeeded=params.batchCount-collected.length
+}
+return collected
+}
+
+// Runs an array through `worker` with at most `limit` in flight at once, preserving output
+// order. Used to process several topics concurrently without unbounded parallelism.
+async function runWithConcurrency(items,limit,worker){
+const results=new Array(items.length)
+let cursor=0
+async function runner(){
+while(true){
+const i=cursor++
+if(i>=items.length) return
+results[i]=await worker(items[i],i)
+}
+}
+const runners=Array.from({length:Math.max(1,Math.min(limit,items.length))},()=>runner())
+await Promise.all(runners)
+return results
 }
 
 // Generates all questions for a single topic spec, in batches of GENERATION_BATCH_SIZE,
-// emitting SSE progress events along the way.
-async function generateForTopic(spec,sendEvent,topicIndex,totalTopics){
+// emitting SSE progress events along the way. dedupState is shared across the whole request
+// so duplicate stems get caught even across different topics/batches.
+async function generateForTopic(spec,sendEvent,topicIndex,totalTopics,dedupState){
 const searchText=buildSearchText(spec)
 const queryVector=await embedOne(searchText)
 
@@ -508,11 +591,11 @@ for(let b=0;b<batches.length;b++){
 const batchCount=batches[b]
 sendEvent('batch_start',{topicIndex,totalTopics,topic:spec.topic,batch:b+1,totalBatches:batches.length,count:batchCount})
 const params={examType:spec.examType,topic:spec.topic,subject:spec.subject,chapter:spec.chapter,difficulty:spec.difficulty,batchCount,pyqText,kbText}
-const batchQuestions=await generateBatchStreaming(params,delta=>{
-sendEvent('token',{topicIndex,totalTopics,topic:spec.topic,batch:b+1,content:delta})
+const batchQuestions=await generateQuestionsForBatch(params,dedupState,q=>{
+sendEvent('question_ready',{topicIndex,totalTopics,topic:spec.topic,batch:b+1,question:q})
 })
 questions=questions.concat(batchQuestions)
-sendEvent('batch_done',{topicIndex,totalTopics,topic:spec.topic,batch:b+1,totalBatches:batches.length,questions:batchQuestions})
+sendEvent('batch_done',{topicIndex,totalTopics,topic:spec.topic,batch:b+1,totalBatches:batches.length,delivered:batchQuestions.length,requested:batchCount})
 }
 
 questions=questions.slice(0,spec.count).map(q=>({
@@ -627,7 +710,8 @@ mongo:mongoConnected?'connected':'disconnected',
 mongoError:lastMongoError,
 questionLimit:question_limit,
 maxTopics:MAX_TOPICS,
-generationBatchSize:GENERATION_BATCH_SIZE
+generationBatchSize:GENERATION_BATCH_SIZE,
+topicConcurrency:TOPIC_CONCURRENCY
 })
 }catch(e){
 res.status(500).json({ok:false,error:e.message})
@@ -720,11 +804,14 @@ limitedToQuestionLimit:limited,
 limitMessage
 })
 
-const results=[]
-for(let t=0;t<specs.length;t++){
-const result=await generateForTopic(specs[t],sendEvent,t+1,specs.length)
-results.push(result)
-}
+// Shared across every topic/batch in this request so duplicate stems get caught even when
+// they show up under a different topic (common when topics overlap, e.g. two Polity subtopics).
+const dedupState={seen:new Set(),recentTexts:[]}
+const results=await runWithConcurrency(
+specs,
+TOPIC_CONCURRENCY,
+(spec,i)=>generateForTopic(spec,sendEvent,i+1,specs.length,dedupState)
+)
 
 let questions=results.flatMap(r=>r.questions)
 const pyqReferencesUsed=results.reduce((a,r)=>a+r.pyqReferencesUsed,0)
