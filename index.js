@@ -32,12 +32,9 @@ const QDRANT_GENERATED_QUESTIONS_COLLECTION=process.env.QDRANT_GENERATED_QUESTIO
 
 const ADMIN_API_KEY=process.env.ADMIN_API_KEY
 
-// PSMODEL_MODEL should point at an explicit, versioned model string from your provider's
-// dashboard (e.g. DeepSeek). Aliases like "deepseek-chat" can be silently repointed by the
-// provider to a newer generation model, so pin explicitly if you need consistent behavior.
-const PSMODEL_ENDPOINT=process.env.PSMODEL_ENDPOINT||'https://api.deepseek.com/chat/completions'
+const PSMODEL_ENDPOINT=process.env.PSMODEL_ENDPOINT
 const PSMODEL_API_KEY=process.env.PSMODEL_API_KEY
-const PSMODEL_MODEL=process.env.PSMODEL_MODEL||'deepseek-chat'
+const PSMODEL_MODEL=process.env.PSMODEL_MODEL
 const PSMODEL_TIMEOUT_MS=parseInt(process.env.PSMODEL_TIMEOUT_MS||'60000',10)
 const PSMODEL_TEMPERATURE=parseFloat(process.env.PSMODEL_TEMPERATURE||'0.7')
 
@@ -77,6 +74,8 @@ difficulty:String,
 topics:[mongoose.Schema.Types.Mixed],
 requestedCount:Number,
 generatedCount:Number,
+// True if one or more topics/batches stopped early or failed, so generatedCount < requestedCount.
+partial:{type:Boolean,default:false},
 limitedToQuestionLimit:Boolean,
 questionLimit:Number,
 pyqReferencesUsed:Number,
@@ -220,10 +219,6 @@ if(start!==-1&&end!==-1&&end>start) cleaned=cleaned.slice(start,end+1)
 return cleaned
 }
 
-// ---- Multi-topic intent extraction ----
-// The admin can now ask for several topics/subjects/difficulties in one message, e.g.
-// "30 Polity questions on Fundamental Rights and 20 tough Geography questions on monsoons".
-// The model returns an array of independent topic "requests" instead of a single object.
 function buildAnalyzePrompt(query){
 const system='You are an intent extraction engine for a Civil Services exam question generation system. Extract structured parameters from the admin natural language request. The request may cover ONE topic or MULTIPLE distinct topics/subjects/difficulty levels in the same message. Always respond with strict JSON only, no markdown, no prose, no code fences.'
 const user=`Admin request: "${query}"
@@ -274,8 +269,6 @@ return []
 }
 }
 
-// Merge per-spec fields with request-level fallbacks (body-level overrides apply to every topic
-// unless that topic already specified its own value).
 function applyFallbacks(spec,fallback){
 return {
 count:spec.count,
@@ -535,6 +528,13 @@ return collected
 
 // Runs an array through `worker` with at most `limit` in flight at once, preserving output
 // order. Used to process several topics concurrently without unbounded parallelism.
+//
+// IMPORTANT: each worker call is individually try/caught. Previously a single rejected worker
+// (e.g. topic 3's embedding/Qdrant lookup failing) would reject the whole Promise.all below,
+// which meant every other topic's already-generated questions - even ones fully finished and
+// already streamed to the client - were discarded and the request ended in a bare error. Now a
+// failing topic is captured as a normal (non-throwing) result so the rest of the request still
+// completes and whatever was generated is still returned.
 async function runWithConcurrency(items,limit,worker){
 const results=new Array(items.length)
 let cursor=0
@@ -542,7 +542,19 @@ async function runner(){
 while(true){
 const i=cursor++
 if(i>=items.length) return
+try{
 results[i]=await worker(items[i],i)
+}catch(e){
+results[i]={
+spec:items[i],
+questions:[],
+pyqReferencesUsed:0,
+knowledgeChunksUsed:0,
+failed:true,
+stoppedEarly:true,
+stopReason:(e&&e.message)||'Unexpected error while generating this topic'
+}
+}
 }
 }
 const runners=Array.from({length:Math.max(1,Math.min(limit,items.length))},()=>runner())
@@ -554,13 +566,27 @@ return results
 // emitting SSE progress events along the way. dedupState is shared across the whole request
 // so duplicate stems get caught even across different topics/batches.
 async function generateForTopic(spec,sendEvent,topicIndex,totalTopics,dedupState){
+// Setup (embedding + Qdrant lookups) used to be unguarded: if it threw, the exception
+// propagated out of this whole function, which - before runWithConcurrency was hardened -
+// wiped out every other topic's results too. It's now caught here as well, defensively, so
+// this topic just reports itself as failed instead of generating anything.
+let pyqPoints,kbPoints
+try{
 const searchText=buildSearchText(spec)
 const queryVector=await embedOne(searchText)
-
-const [pyqPoints,kbPoints]=await Promise.all([
+;[pyqPoints,kbPoints]=await Promise.all([
 searchQuestionBank(queryVector,QUESTION_BANK_TOP_K),
 searchKnowledgeBase(queryVector,KNOWLEDGE_BASE_TOP_K)
 ])
+}catch(e){
+const stopReason=`Could not look up reference material for "${spec.topic}": ${(e&&e.message)||'unknown error'}`
+sendEvent('topic_error',{topicIndex,totalTopics,topic:spec.topic,error:stopReason})
+sendEvent('topic_done',{
+topicIndex,totalTopics,topic:spec.topic,generatedCount:0,
+totalBatches:0,completedBatches:0,stoppedEarly:true,stopReason,failed:true
+})
+return {spec,questions:[],pyqReferencesUsed:0,knowledgeChunksUsed:0,failed:true,stoppedEarly:true,stopReason}
+}
 
 const pyqText=formatPYQs(pyqPoints)
 const kbText=formatKnowledge(kbPoints)
@@ -587,15 +613,41 @@ remaining-=size
 }
 
 let questions=[]
+let completedBatches=0
+let stoppedEarly=false
+let stopReason=null
+
 for(let b=0;b<batches.length;b++){
 const batchCount=batches[b]
 sendEvent('batch_start',{topicIndex,totalTopics,topic:spec.topic,batch:b+1,totalBatches:batches.length,count:batchCount})
 const params={examType:spec.examType,topic:spec.topic,subject:spec.subject,chapter:spec.chapter,difficulty:spec.difficulty,batchCount,pyqText,kbText}
-const batchQuestions=await generateQuestionsForBatch(params,dedupState,q=>{
+
+let batchQuestions=[]
+try{
+batchQuestions=await generateQuestionsForBatch(params,dedupState,q=>{
 sendEvent('question_ready',{topicIndex,totalTopics,topic:spec.topic,batch:b+1,question:q})
 })
-questions=questions.concat(batchQuestions)
+}catch(e){
+// generateQuestionsForBatch already swallows its own retry errors and returns [] rather
+// than throwing, but guard here too so one bad batch can never take the whole topic down.
+batchQuestions=[]
+}
+
 sendEvent('batch_done',{topicIndex,totalTopics,topic:spec.topic,batch:b+1,totalBatches:batches.length,delivered:batchQuestions.length,requested:batchCount})
+
+// A batch that produced NOTHING after all internal retries means something is
+// systemically wrong (rate limit, outage, bad key) rather than a one-off shortfall.
+// Stop here and hand back everything already generated in prior batches, instead of
+// either losing it (old behavior on a hard crash) or silently grinding through more
+// batches that are likely to fail the same way.
+if(batchQuestions.length===0){
+stoppedEarly=true
+stopReason=`Batch ${b+1} of ${batches.length} produced no questions after retries, so the remaining batches for this topic were skipped.`
+break
+}
+
+questions=questions.concat(batchQuestions)
+completedBatches++
 }
 
 questions=questions.slice(0,spec.count).map(q=>({
@@ -608,10 +660,14 @@ sendEvent('topic_done',{
 topicIndex,
 totalTopics,
 topic:spec.topic,
-generatedCount:questions.length
+generatedCount:questions.length,
+totalBatches:batches.length,
+completedBatches,
+stoppedEarly,
+stopReason
 })
 
-return {spec,questions,pyqReferencesUsed:pyqPoints.length,knowledgeChunksUsed:kbPoints.length}
+return {spec,questions,pyqReferencesUsed:pyqPoints.length,knowledgeChunksUsed:kbPoints.length,stoppedEarly,stopReason}
 }
 
 async function saveGeneratedQuestions(questions,meta){
@@ -813,14 +869,37 @@ TOPIC_CONCURRENCY,
 (spec,i)=>generateForTopic(spec,sendEvent,i+1,specs.length,dedupState)
 )
 
-let questions=results.flatMap(r=>r.questions)
-const pyqReferencesUsed=results.reduce((a,r)=>a+r.pyqReferencesUsed,0)
-const knowledgeChunksUsed=results.reduce((a,r)=>a+r.knowledgeChunksUsed,0)
+let questions=results.flatMap(r=>r.questions||[])
+const pyqReferencesUsed=results.reduce((a,r)=>a+(r.pyqReferencesUsed||0),0)
+const knowledgeChunksUsed=results.reduce((a,r)=>a+(r.knowledgeChunksUsed||0),0)
+
+// Per-topic status so the client can show exactly what finished, what was partial, and why -
+// instead of an all-or-nothing success/error.
+const topicsResult=specs.map((s,i)=>{
+const r=results[i]||{}
+return {
+topic:s.topic,
+examType:s.examType,
+subject:s.subject,
+chapter:s.chapter,
+difficulty:s.difficulty,
+keywords:s.keywords,
+requestedCount:s.requestedCount,
+count:s.count,
+generatedCount:(r.questions||[]).length,
+stoppedEarly:!!r.stoppedEarly,
+stopReason:r.stopReason||null,
+failed:!!r.failed
+}
+})
+const partial=topicsResult.some(t=>t.stoppedEarly||t.failed)
 
 sendEvent('done',{
 requestId,
 generatedCount:questions.length,
 totalTopics:specs.length,
+partial,
+topics:topicsResult,
 questions
 })
 
@@ -844,19 +923,10 @@ topic:first.topic,
 chapter:first.chapter||null,
 keywords:first.keywords||[],
 difficulty:first.difficulty||null,
-topics:specs.map((s,i)=>({
-topic:s.topic,
-examType:s.examType,
-subject:s.subject,
-chapter:s.chapter,
-difficulty:s.difficulty,
-keywords:s.keywords,
-requestedCount:s.requestedCount,
-count:s.count,
-generatedCount:results[i]?results[i].questions.length:0
-})),
+topics:topicsResult,
 requestedCount:totalRequested,
 generatedCount:questions.length,
+partial,
 limitedToQuestionLimit:limited,
 questionLimit:question_limit,
 pyqReferencesUsed,
