@@ -32,9 +32,12 @@ const QDRANT_GENERATED_QUESTIONS_COLLECTION=process.env.QDRANT_GENERATED_QUESTIO
 
 const ADMIN_API_KEY=process.env.ADMIN_API_KEY
 
-const PSMODEL_ENDPOINT=process.env.PSMODEL_ENDPOINT
+// PSMODEL_MODEL should point at an explicit, versioned model string from your provider's
+// dashboard (e.g. DeepSeek). Aliases like "deepseek-chat" can be silently repointed by the
+// provider to a newer generation model, so pin explicitly if you need consistent behavior.
+const PSMODEL_ENDPOINT=process.env.PSMODEL_ENDPOINT||'https://api.deepseek.com/chat/completions'
 const PSMODEL_API_KEY=process.env.PSMODEL_API_KEY
-const PSMODEL_MODEL=process.env.PSMODEL_MODEL
+const PSMODEL_MODEL=process.env.PSMODEL_MODEL||'deepseek-chat'
 const PSMODEL_TIMEOUT_MS=parseInt(process.env.PSMODEL_TIMEOUT_MS||'60000',10)
 const PSMODEL_TEMPERATURE=parseFloat(process.env.PSMODEL_TEMPERATURE||'0.7')
 
@@ -57,6 +60,9 @@ const GENERATION_BATCH_SIZE=parseInt(process.env.GENERATION_BATCH_SIZE||'25',10)
 const TOPIC_CONCURRENCY=parseInt(process.env.TOPIC_CONCURRENCY||'2',10)
 const SAVE_GENERATED_TO_QDRANT=process.env.SAVE_GENERATED_TO_QDRANT!=='false'
 const QDRANT_UPSERT_BATCH_SIZE=parseInt(process.env.QDRANT_UPSERT_BATCH_SIZE||'64',10)
+// How many previously-generated questions (across ALL past requests, found by semantic
+// similarity) to pull in as an "avoid repeating these" reference when generating a topic.
+const GENERATED_DEDUP_TOP_K=parseInt(process.env.GENERATED_DEDUP_TOP_K||'15',10)
 
 const qdrant=new QdrantClient({url:QDRANT_URL,apiKey:QDRANT_API_KEY})
 
@@ -189,6 +195,42 @@ with_payload:true
 return result.points||[]
 }
 
+async function searchGeneratedQuestions(vector,topK){
+try{
+const result=await qdrant.query(QDRANT_GENERATED_QUESTIONS_COLLECTION,{
+query:vector,
+limit:topK,
+with_payload:true
+})
+return result.points||[]
+}catch(e){
+return []
+}
+}
+
+let generatedCollectionEnsured=false
+async function ensureGeneratedQuestionsCollection(vectorSize){
+if(generatedCollectionEnsured) return
+try{
+await qdrant.getCollection(QDRANT_GENERATED_QUESTIONS_COLLECTION)
+generatedCollectionEnsured=true
+return
+}catch(e){
+// Fall through - most likely "collection doesn't exist yet".
+}
+try{
+await qdrant.createCollection(QDRANT_GENERATED_QUESTIONS_COLLECTION,{
+vectors:{size:vectorSize,distance:'Cosine'}
+})
+generatedCollectionEnsured=true
+}catch(e){
+// Another concurrent request may have created it first between the check and here - that's
+// fine. Anything else is a real problem and should surface to the caller.
+if(!/already exists|409/i.test(e.message||'')) throw e
+generatedCollectionEnsured=true
+}
+}
+
 function formatPYQs(points){
 if(!points.length) return 'None found'
 return points.map((p,i)=>{
@@ -269,6 +311,8 @@ return []
 }
 }
 
+// Merge per-spec fields with request-level fallbacks (body-level overrides apply to every topic
+// unless that topic already specified its own value).
 function applyFallbacks(spec,fallback){
 return {
 count:spec.count,
@@ -466,15 +510,10 @@ return null
 }
 }
 
-// Normalizes a question stem for duplicate detection: lowercase, strip punctuation, collapse
-// whitespace. Doesn't need to be perfect — it only needs to catch near-identical repeats.
 function normalizeStem(text){
 return (text||'').toLowerCase().replace(/[^a-z0-9\s]/g,'').replace(/\s+/g,' ').trim().slice(0,120)
 }
 
-// Buffers streamed token deltas and emits complete lines to onLine as soon as a newline
-// arrives, so questions can be accepted (and even shown to the user) mid-stream instead of
-// only after the whole batch finishes.
 function createLineAccumulator(onLine){
 let buffer=''
 return {
@@ -494,14 +533,15 @@ buffer=''
 }
 }
 
-// Generates exactly params.batchCount NEW (non-duplicate) questions for one batch, retrying
-// only the shortfall (not the whole batch) up to 2 extra times if lines were dropped, invalid,
-// or duplicates. dedupState is shared across the whole request (all topics, all batches).
 async function generateQuestionsForBatch(params,dedupState,onQuestion){
 let stillNeeded=params.batchCount
 let collected=[]
 for(let attempt=0;attempt<3&&stillNeeded>0;attempt++){
-const avoidList=dedupState.recentTexts.slice(-20)
+
+const avoidList=[
+...dedupState.historicalTexts.slice(-10),
+...dedupState.recentTexts.slice(-15)
+]
 const passParams={...params,batchCount:stillNeeded,avoidList}
 const maxTokens=clamp(stillNeeded*230+300,600,16000)
 const {system,user}=buildPrompt(passParams)
@@ -526,15 +566,6 @@ stillNeeded=params.batchCount-collected.length
 return collected
 }
 
-// Runs an array through `worker` with at most `limit` in flight at once, preserving output
-// order. Used to process several topics concurrently without unbounded parallelism.
-//
-// IMPORTANT: each worker call is individually try/caught. Previously a single rejected worker
-// (e.g. topic 3's embedding/Qdrant lookup failing) would reject the whole Promise.all below,
-// which meant every other topic's already-generated questions - even ones fully finished and
-// already streamed to the client - were discarded and the request ended in a bare error. Now a
-// failing topic is captured as a normal (non-throwing) result so the rest of the request still
-// completes and whatever was generated is still returned.
 async function runWithConcurrency(items,limit,worker){
 const results=new Array(items.length)
 let cursor=0
@@ -562,22 +593,25 @@ await Promise.all(runners)
 return results
 }
 
-// Generates all questions for a single topic spec, in batches of GENERATION_BATCH_SIZE,
-// emitting SSE progress events along the way. dedupState is shared across the whole request
-// so duplicate stems get caught even across different topics/batches.
 async function generateForTopic(spec,sendEvent,topicIndex,totalTopics,dedupState){
-// Setup (embedding + Qdrant lookups) used to be unguarded: if it threw, the exception
-// propagated out of this whole function, which - before runWithConcurrency was hardened -
-// wiped out every other topic's results too. It's now caught here as well, defensively, so
-// this topic just reports itself as failed instead of generating anything.
 let pyqPoints,kbPoints
 try{
 const searchText=buildSearchText(spec)
 const queryVector=await embedOne(searchText)
-;[pyqPoints,kbPoints]=await Promise.all([
+const [pyq,kb,pastGenerated]=await Promise.all([
 searchQuestionBank(queryVector,QUESTION_BANK_TOP_K),
-searchKnowledgeBase(queryVector,KNOWLEDGE_BASE_TOP_K)
+searchKnowledgeBase(queryVector,KNOWLEDGE_BASE_TOP_K),
+searchGeneratedQuestions(queryVector,GENERATED_DEDUP_TOP_K)
 ])
+pyqPoints=pyq
+kbPoints=kb
+
+for(const p of pastGenerated){
+const stem=normalizeStem(p.payload&&p.payload.question)
+if(!stem||dedupState.seen.has(stem)) continue
+dedupState.seen.add(stem)
+dedupState.historicalTexts.push((p.payload.question||'').slice(0,140))
+}
 }catch(e){
 const stopReason=`Could not look up reference material for "${spec.topic}": ${(e&&e.message)||'unknown error'}`
 sendEvent('topic_error',{topicIndex,totalTopics,topic:spec.topic,error:stopReason})
@@ -674,6 +708,7 @@ async function saveGeneratedQuestions(questions,meta){
 if(!SAVE_GENERATED_TO_QDRANT||!questions.length) return 0
 const texts=questions.map(q=>[q.question,...Object.values(q.options||{})].join(' '))
 const vectors=await embedTexts(texts)
+await ensureGeneratedQuestionsCollection(vectors[0].length)
 const points=questions.map((q,i)=>({
 id:crypto.randomUUID(),
 vector:vectors[i],
@@ -862,7 +897,9 @@ limitMessage
 
 // Shared across every topic/batch in this request so duplicate stems get caught even when
 // they show up under a different topic (common when topics overlap, e.g. two Polity subtopics).
-const dedupState={seen:new Set(),recentTexts:[]}
+// historicalTexts is populated per-topic from past requests (see generateForTopic) so repeats
+// are also caught across different generation sessions, not just within this one.
+const dedupState={seen:new Set(),recentTexts:[],historicalTexts:[]}
 const results=await runWithConcurrency(
 specs,
 TOPIC_CONCURRENCY,
@@ -904,13 +941,16 @@ questions
 })
 
 let savedToQdrant=0
+let qdrantError=null
 try{
 savedToQdrant=await saveGeneratedQuestions(questions,{requestId,examType:specs[0].examType,subject:specs[0].subject,topic:specs[0].topic,chapter:specs[0].chapter,difficulty:specs[0].difficulty})
 }catch(e){
-console.error('[saveGeneratedQuestions]',e.message)
+qdrantError=e.message||'Unknown error saving to Qdrant'
+console.error('[saveGeneratedQuestions]',qdrantError)
 }
 
 let mongoId=null
+let mongoError=null
 try{
 if(await connectMongo()){
 const first=specs[0]
@@ -936,15 +976,22 @@ model:PSMODEL_MODEL,
 savedToQdrant
 })
 mongoId=doc._id.toString()
+}else{
+mongoError=PSMODELCHATHISDB_URI
+?`MongoDB is configured but not reachable: ${lastMongoError||'connection failed'}`
+:'PSMODELCHATHISDB_URI is not set, so chat history cannot be saved.'
 }
 }catch(e){
-console.error('[mongo save]',e.message)
+mongoError=e.message||'Unknown error saving chat history'
+console.error('[mongo save]',mongoError)
 }
 
 sendEvent('persisted',{
 requestId,
 mongoId,
-savedToQdrant
+savedToQdrant,
+mongoError,
+qdrantError
 })
 res.end()
 }catch(e){
