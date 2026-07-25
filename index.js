@@ -10,6 +10,13 @@ const {QdrantClient}=require('@qdrant/js-client-rest')
 const {EmbeddingModel,FlagEmbedding}=require('fastembed')
 
 const app=express()
+
+process.on('unhandledRejection',(reason)=>{
+console.error('[unhandledRejection] backend kept alive despite this:',reason)
+})
+process.on('uncaughtException',(err)=>{
+console.error('[uncaughtException] backend kept alive despite this:',err)
+})
 const PORT=process.env.PORT||8080
 const ALLOWED_ORIGINS=(process.env.ALLOWED_ORIGINS||'*').split(',').map(s=>s.trim()).filter(Boolean)
 const corsOpts={
@@ -195,6 +202,10 @@ with_payload:true
 return result.points||[]
 }
 
+// Semantic lookup of previously-generated questions, used to build a cross-request "don't
+// repeat these" list so the same topic asked again on a different day doesn't produce near-
+// identical questions. Safe to call before the collection has ever been created (e.g. the very
+// first generation request ever run) - just returns no results instead of throwing.
 async function searchGeneratedQuestions(vector,topK){
 try{
 const result=await qdrant.query(QDRANT_GENERATED_QUESTIONS_COLLECTION,{
@@ -261,6 +272,10 @@ if(start!==-1&&end!==-1&&end>start) cleaned=cleaned.slice(start,end+1)
 return cleaned
 }
 
+// ---- Multi-topic intent extraction ----
+// The admin can now ask for several topics/subjects/difficulties in one message, e.g.
+// "30 Polity questions on Fundamental Rights and 20 tough Geography questions on monsoons".
+// The model returns an array of independent topic "requests" instead of a single object.
 function buildAnalyzePrompt(query){
 const system='You are an intent extraction engine for a Civil Services exam question generation system. Extract structured parameters from the admin natural language request. The request may cover ONE topic or MULTIPLE distinct topics/subjects/difficulty levels in the same message. Always respond with strict JSON only, no markdown, no prose, no code fences.'
 const user=`Admin request: "${query}"
@@ -510,10 +525,15 @@ return null
 }
 }
 
+// Normalizes a question stem for duplicate detection: lowercase, strip punctuation, collapse
+// whitespace. Doesn't need to be perfect — it only needs to catch near-identical repeats.
 function normalizeStem(text){
 return (text||'').toLowerCase().replace(/[^a-z0-9\s]/g,'').replace(/\s+/g,' ').trim().slice(0,120)
 }
 
+// Buffers streamed token deltas and emits complete lines to onLine as soon as a newline
+// arrives, so questions can be accepted (and even shown to the user) mid-stream instead of
+// only after the whole batch finishes.
 function createLineAccumulator(onLine){
 let buffer=''
 return {
@@ -533,11 +553,16 @@ buffer=''
 }
 }
 
+// Generates exactly params.batchCount NEW (non-duplicate) questions for one batch, retrying
+// only the shortfall (not the whole batch) up to 2 extra times if lines were dropped, invalid,
+// or duplicates. dedupState is shared across the whole request (all topics, all batches).
 async function generateQuestionsForBatch(params,dedupState,onQuestion){
 let stillNeeded=params.batchCount
 let collected=[]
 for(let attempt=0;attempt<3&&stillNeeded>0;attempt++){
-
+// Mix in a handful of historical (cross-request) stems alongside this request's own recent
+// ones, so the model avoids repeating both what it just wrote AND what it wrote last time
+// this topic was requested.
 const avoidList=[
 ...dedupState.historicalTexts.slice(-10),
 ...dedupState.recentTexts.slice(-15)
@@ -566,6 +591,15 @@ stillNeeded=params.batchCount-collected.length
 return collected
 }
 
+// Runs an array through `worker` with at most `limit` in flight at once, preserving output
+// order. Used to process several topics concurrently without unbounded parallelism.
+//
+// IMPORTANT: each worker call is individually try/caught. Previously a single rejected worker
+// (e.g. topic 3's embedding/Qdrant lookup failing) would reject the whole Promise.all below,
+// which meant every other topic's already-generated questions - even ones fully finished and
+// already streamed to the client - were discarded and the request ended in a bare error. Now a
+// failing topic is captured as a normal (non-throwing) result so the rest of the request still
+// completes and whatever was generated is still returned.
 async function runWithConcurrency(items,limit,worker){
 const results=new Array(items.length)
 let cursor=0
@@ -593,7 +627,14 @@ await Promise.all(runners)
 return results
 }
 
+// Generates all questions for a single topic spec, in batches of GENERATION_BATCH_SIZE,
+// emitting SSE progress events along the way. dedupState is shared across the whole request
+// so duplicate stems get caught even across different topics/batches.
 async function generateForTopic(spec,sendEvent,topicIndex,totalTopics,dedupState){
+// Setup (embedding + Qdrant lookups) used to be unguarded: if it threw, the exception
+// propagated out of this whole function, which - before runWithConcurrency was hardened -
+// wiped out every other topic's results too. It's now caught here as well, defensively, so
+// this topic just reports itself as failed instead of generating anything.
 let pyqPoints,kbPoints
 try{
 const searchText=buildSearchText(spec)
@@ -605,7 +646,8 @@ searchGeneratedQuestions(queryVector,GENERATED_DEDUP_TOP_K)
 ])
 pyqPoints=pyq
 kbPoints=kb
-
+// Seed the shared dedup state with questions generated for this same topic area in PAST
+// requests, so they're excluded exactly like duplicates generated earlier in this request.
 for(const p of pastGenerated){
 const stem=normalizeStem(p.payload&&p.payload.question)
 if(!stem||dedupState.seen.has(stem)) continue
@@ -826,8 +868,20 @@ res.setHeader('Connection','keep-alive')
 res.setHeader('X-Accel-Buffering','no')
 res.flushHeaders()
 
+// If the client disconnects mid-stream (closed tab, lost network), writing to `res` afterwards
+// emits an 'error' event on the stream - with no listener that becomes an unhandled exception
+// and, per the safety net above, would otherwise be one more way to bring the whole server down
+// over something as ordinary as someone closing a browser tab mid-generation.
+res.on('error',(err)=>{
+console.error('[response stream error]',err.message)
+})
+
 function sendEvent(event,data){
+try{
 res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+}catch(e){
+console.error('[sendEvent write failed]',e.message)
+}
 }
 
 const requestId=crypto.randomUUID()
