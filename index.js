@@ -39,12 +39,10 @@ const QDRANT_GENERATED_QUESTIONS_COLLECTION=process.env.QDRANT_GENERATED_QUESTIO
 
 const ADMIN_API_KEY=process.env.ADMIN_API_KEY
 
-// PSMODEL_MODEL should point at an explicit, versioned model string from your provider's
-// dashboard (e.g. DeepSeek). Aliases like "deepseek-chat" can be silently repointed by the
-// provider to a newer generation model, so pin explicitly if you need consistent behavior.
-const PSMODEL_ENDPOINT=process.env.PSMODEL_ENDPOINT||'https://api.deepseek.com/chat/completions'
+
+const PSMODEL_ENDPOINT=process.env.PSMODEL_ENDPOINT
 const PSMODEL_API_KEY=process.env.PSMODEL_API_KEY
-const PSMODEL_MODEL=process.env.PSMODEL_MODEL||'deepseek-chat'
+const PSMODEL_MODEL=process.env.PSMODEL_MODEL
 const PSMODEL_TIMEOUT_MS=parseInt(process.env.PSMODEL_TIMEOUT_MS||'60000',10)
 const PSMODEL_TEMPERATURE=parseFloat(process.env.PSMODEL_TEMPERATURE||'0.7')
 
@@ -59,11 +57,7 @@ const question_limit=parseInt(process.env.QUESTION_LIMIT||'100',10)
 const MAX_TOPICS=parseInt(process.env.MAX_TOPICS||'8',10)
 const QUESTION_BANK_TOP_K=parseInt(process.env.QUESTION_BANK_TOP_K||'12',10)
 const KNOWLEDGE_BASE_TOP_K=parseInt(process.env.KNOWLEDGE_BASE_TOP_K||'10',10)
-// Batches are NDJSON (one question per line) with per-line parsing and shortfall-only retries,
-// so a broken/truncated line no longer costs you the whole batch. That makes larger batches safe.
 const GENERATION_BATCH_SIZE=parseInt(process.env.GENERATION_BATCH_SIZE||'25',10)
-// How many topics run concurrently in a multi-topic request. Independent topics don't need to
-// wait on each other; keep this modest to stay under your PSMODEL provider's rate limits.
 const TOPIC_CONCURRENCY=parseInt(process.env.TOPIC_CONCURRENCY||'2',10)
 const SAVE_GENERATED_TO_QDRANT=process.env.SAVE_GENERATED_TO_QDRANT!=='false'
 const QDRANT_UPSERT_BATCH_SIZE=parseInt(process.env.QDRANT_UPSERT_BATCH_SIZE||'64',10)
@@ -76,7 +70,6 @@ const qdrant=new QdrantClient({url:QDRANT_URL,apiKey:QDRANT_API_KEY})
 const chatHistorySchema=new mongoose.Schema({
 requestId:{type:String,index:true},
 adminQuery:String,
-// Deprecated single-topic fields, kept populated (from the first topic) for backward compatibility.
 examType:String,
 subject:String,
 topic:String,
@@ -219,6 +212,12 @@ return []
 }
 }
 
+// The question_bank/knowledge_base collections are expected to be pre-populated by the RAG
+// ingestion pipeline, but generated_questions is written to by THIS service and was never
+// created anywhere - so on a fresh Qdrant instance every upsert into it fails with a
+// "collection not found" error that was previously only logged server-side, making saves look
+// like they silently did nothing. This creates it on first use, matching the vector size of
+// whatever embedding model is actually configured (rather than a hardcoded dimension).
 let generatedCollectionEnsured=false
 async function ensureGeneratedQuestionsCollection(vectorSize){
 if(generatedCollectionEnsured) return
@@ -560,12 +559,15 @@ async function generateQuestionsForBatch(params,dedupState,onQuestion){
 let stillNeeded=params.batchCount
 let collected=[]
 for(let attempt=0;attempt<3&&stillNeeded>0;attempt++){
-// Mix in a handful of historical (cross-request) stems alongside this request's own recent
-// ones, so the model avoids repeating both what it just wrote AND what it wrote last time
-// this topic was requested.
+// Mix in a handful of historical (cross-request) stems alongside ALL of this request's own
+// stems for this topic so far. This used to cap the in-request list at the last 15, which
+// silently forgot anything earlier once a topic needed more than one batch (e.g. 30 requested
+// = a 25-question batch + a 5-question remainder batch - the remainder batch could only see
+// the last 15 of those 25, so the first 10 were invisible and free to repeat). Uncapped here
+// since this only affects prompt input size (cheap), not the output token budget.
 const avoidList=[
 ...dedupState.historicalTexts.slice(-10),
-...dedupState.recentTexts.slice(-15)
+...dedupState.recentTexts.slice(-60)
 ]
 const passParams={...params,batchCount:stillNeeded,avoidList}
 const maxTokens=clamp(stillNeeded*230+300,600,16000)
@@ -884,6 +886,22 @@ console.error('[sendEvent write failed]',e.message)
 }
 }
 
+// Generation itself sends frequent events, so the connection never goes idle. But the SAVE step
+// right after 'done' - embedding all the just-generated questions, upserting them into Qdrant,
+// writing the Mongo record - can run for many seconds with zero bytes written to the client, and
+// many reverse proxies / load balancers (nginx, ALBs, PaaS platforms) will silently kill an HTTP
+// connection after ~30-60s of no data. That's the most likely cause of a "network error" that
+// shows up specifically right after a big (e.g. 80-question) generation finishes: the response
+// looked idle right when the save was actually doing the most work. A ": comment" line is valid
+// SSE (ignored by the client's parser, doesn't fire any event) and is enough to keep it alive.
+const heartbeat=setInterval(()=>{
+try{
+res.write(': keep-alive\n\n')
+}catch(e){
+// ignore - the res.on('error') listener above already logs real connection problems
+}
+},15000)
+
 const requestId=crypto.randomUUID()
 
 try{
@@ -994,19 +1012,16 @@ topics:topicsResult,
 questions
 })
 
-let savedToQdrant=0
-let qdrantError=null
-try{
-savedToQdrant=await saveGeneratedQuestions(questions,{requestId,examType:specs[0].examType,subject:specs[0].subject,topic:specs[0].topic,chapter:specs[0].chapter,difficulty:specs[0].difficulty})
-}catch(e){
-qdrantError=e.message||'Unknown error saving to Qdrant'
-console.error('[saveGeneratedQuestions]',qdrantError)
+// Run both saves concurrently (they're independent) rather than back-to-back, which roughly
+// halves how long the connection sits silent right when the heartbeat above matters most.
+const [qdrantOutcome,mongoOutcome]=await Promise.allSettled([
+saveGeneratedQuestions(questions,{requestId,examType:specs[0].examType,subject:specs[0].subject,topic:specs[0].topic,chapter:specs[0].chapter,difficulty:specs[0].difficulty}),
+(async()=>{
+if(!(await connectMongo())){
+return {mongoId:null,mongoError:PSMODELCHATHISDB_URI
+?`MongoDB is configured but not reachable: ${lastMongoError||'connection failed'}`
+:'PSMODELCHATHISDB_URI is not set, so chat history cannot be saved.'}
 }
-
-let mongoId=null
-let mongoError=null
-try{
-if(await connectMongo()){
 const first=specs[0]
 const doc=await ChatHistory.create({
 requestId,
@@ -1027,16 +1042,30 @@ pyqReferencesUsed,
 knowledgeChunksUsed,
 questions,
 model:PSMODEL_MODEL,
-savedToQdrant
+// savedToQdrant isn't known yet since this runs concurrently with the Qdrant save above -
+// left as 0 here; it's a display-only convenience field and not load-bearing anywhere.
+savedToQdrant:0
 })
-mongoId=doc._id.toString()
+return {mongoId:doc._id.toString(),mongoError:null}
+})()
+])
+
+let savedToQdrant=0
+let qdrantError=null
+if(qdrantOutcome.status==='fulfilled'){
+savedToQdrant=qdrantOutcome.value
 }else{
-mongoError=PSMODELCHATHISDB_URI
-?`MongoDB is configured but not reachable: ${lastMongoError||'connection failed'}`
-:'PSMODELCHATHISDB_URI is not set, so chat history cannot be saved.'
+qdrantError=qdrantOutcome.reason&&qdrantOutcome.reason.message||'Unknown error saving to Qdrant'
+console.error('[saveGeneratedQuestions]',qdrantError)
 }
-}catch(e){
-mongoError=e.message||'Unknown error saving chat history'
+
+let mongoId=null
+let mongoError=null
+if(mongoOutcome.status==='fulfilled'){
+mongoId=mongoOutcome.value.mongoId
+mongoError=mongoOutcome.value.mongoError
+}else{
+mongoError=mongoOutcome.reason&&mongoOutcome.reason.message||'Unknown error saving chat history'
 console.error('[mongo save]',mongoError)
 }
 
@@ -1047,6 +1076,14 @@ savedToQdrant,
 mongoError,
 qdrantError
 })
+
+if(mongoId&&savedToQdrant>0){
+try{
+await ChatHistory.updateOne({_id:mongoId},{$set:{savedToQdrant}})
+}catch(e){
+console.error('[mongo savedToQdrant backfill]',e.message)
+}
+}
 res.end()
 }catch(e){
 console.error('[generate]',e)
@@ -1054,6 +1091,8 @@ try{
 sendEvent('error',{error:e.message||'Internal error'})
 }catch(_){}
 res.end()
+}finally{
+clearInterval(heartbeat)
 }
 })
 
