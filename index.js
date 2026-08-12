@@ -204,22 +204,39 @@ return []
 }
 
 let generatedCollectionEnsured=false
-async function ensureGeneratedQuestionsCollection(vectorSize){
+
+// Checks (and creates if missing) the generated_questions collection.
+// IMPORTANT: this now also validates that an *existing* collection's vector
+// size actually matches what the current embedding model produces. A silent
+// mismatch here (e.g. collection created under a different EMBEDDING_MODEL_NAME
+// in the past) is the most common cause of every upsert failing with a cryptic
+// Qdrant error, so we surface it as a clear, descriptive error instead.
+async function ensureGeneratedQuestionsCollection(vectorSize,log){
+const debugLog=log||(()=>{})
 if(generatedCollectionEnsured) return
 try{
-await qdrant.getCollection(QDRANT_GENERATED_QUESTIONS_COLLECTION)
+const info=await qdrant.getCollection(QDRANT_GENERATED_QUESTIONS_COLLECTION)
+const existingSize=(info&&info.config&&info.config.params&&info.config.params.vectors)?info.config.params.vectors.size:null
+debugLog(`Collection "${QDRANT_GENERATED_QUESTIONS_COLLECTION}" already exists (vector size ${existingSize})`)
+if(existingSize!=null&&existingSize!==vectorSize){
+throw new Error(`Vector size mismatch: collection "${QDRANT_GENERATED_QUESTIONS_COLLECTION}" was created with ${existingSize} dims, but the current embedding model "${EMBEDDING_MODEL_NAME}" produces ${vectorSize} dims. Either recreate the collection or fix EMBEDDING_MODEL_NAME.`)
+}
 generatedCollectionEnsured=true
 return
 }catch(e){
+if(/Vector size mismatch/.test(e.message||'')) throw e
+debugLog(`Collection "${QDRANT_GENERATED_QUESTIONS_COLLECTION}" not found or unreadable (${e.message}), attempting to create it`)
 }
 try{
 await qdrant.createCollection(QDRANT_GENERATED_QUESTIONS_COLLECTION,{
 vectors:{size:vectorSize,distance:'Cosine'}
 })
 generatedCollectionEnsured=true
+debugLog(`Created collection "${QDRANT_GENERATED_QUESTIONS_COLLECTION}" with vector size ${vectorSize}`)
 }catch(e){
 if(!/already exists|409/i.test(e.message||'')) throw e
 generatedCollectionEnsured=true
+debugLog(`Collection "${QDRANT_GENERATED_QUESTIONS_COLLECTION}" already existed on create race, continuing`)
 }
 }
 
@@ -676,23 +693,88 @@ stopReason
 return {spec,questions,pyqReferencesUsed:pyqPoints.length,knowledgeChunksUsed:kbPoints.length,stoppedEarly,stopReason}
 }
 
+// Saves generated questions to Qdrant with full debug instrumentation.
+// Returns {savedCount, totalQuestions, debug} — debug always contains a
+// per-batch/per-chunk breakdown plus any errors encountered, so it can be
+// surfaced directly in an API response or an SSE event and inspected in
+// the browser Network tab instead of only appearing in server logs.
 async function saveGeneratedQuestions(questions,meta){
-if(!SAVE_GENERATED_TO_QDRANT||!questions.length) return 0
+const debug={
+requestId:meta.requestId||null,
+collection:QDRANT_GENERATED_QUESTIONS_COLLECTION,
+embeddingModel:EMBEDDING_MODEL_NAME,
+saveGeneratedToQdrant:SAVE_GENERATED_TO_QDRANT,
+totalQuestions:questions.length,
+startedAt:new Date().toISOString(),
+finishedAt:null,
+savedCount:0,
+skipped:null,
+fatalError:null,
+batches:[],
+errors:[],
+logs:[]
+}
+const log=(msg)=>{
+console.log(`[saveGeneratedQuestions]${meta.requestId?` [${meta.requestId}]`:''} ${msg}`)
+debug.logs.push(msg)
+}
+
+if(!SAVE_GENERATED_TO_QDRANT){
+debug.skipped='SAVE_GENERATED_TO_QDRANT is set to false'
+debug.finishedAt=new Date().toISOString()
+log(debug.skipped)
+return {savedCount:0,totalQuestions:questions.length,debug}
+}
+if(!questions.length){
+debug.skipped='No questions were passed to save'
+debug.finishedAt=new Date().toISOString()
+log(debug.skipped)
+return {savedCount:0,totalQuestions:0,debug}
+}
+
+log(`Starting save of ${questions.length} questions to "${QDRANT_GENERATED_QUESTIONS_COLLECTION}"`)
+
+let embedder
+try{
+embedder=await getEmbedder()
+}catch(e){
+log(`Failed to initialize embedder: ${e.message}`)
+debug.fatalError=`embedder_init: ${e.message}`
+debug.finishedAt=new Date().toISOString()
+const err=new Error(`Failed to initialize embedder: ${e.message}`)
+err.debug=debug
+throw err
+}
+
 const texts=questions.map(q=>[q.question,...Object.values(q.options||{})].join(' '))
-const embedder=await getEmbedder()
 const upsertPromises=[]
 let offset=0
+let batchIndex=0
+
+try{
 for await(const vectorBatch of embedder.embed(texts,SAVE_EMBEDDING_BATCH_SIZE)){
+batchIndex++
+const batchStartedAt=Date.now()
 const batchQuestions=questions.slice(offset,offset+vectorBatch.length)
 offset+=vectorBatch.length
-if(!generatedCollectionEnsured) await ensureGeneratedQuestionsCollection(vectorBatch[0].length)
+const vectorSize=vectorBatch.length?vectorBatch[0].length:null
+log(`Batch ${batchIndex}: embedded ${batchQuestions.length} questions (dim=${vectorSize})`)
+
+try{
+if(!generatedCollectionEnsured) await ensureGeneratedQuestionsCollection(vectorSize,log)
+}catch(e){
+log(`Batch ${batchIndex}: collection check/create failed: ${e.message}`)
+debug.errors.push({stage:'ensure_collection',batch:batchIndex,error:e.message})
+throw e
+}
+
 const points=batchQuestions.map((q,j)=>({
 id:crypto.randomUUID(),
 vector:Array.from(vectorBatch[j]),
 payload:{
 exam:q.examType||meta.examType||null,
 subject:q.subject||meta.subject||null,
-topic:q.topic||meta.topic,
+topic:q.topic||meta.topic||null,
 chapter:q.chapter||meta.chapter||null,
 question:q.question,
 options:q.options,
@@ -701,23 +783,50 @@ explanation:q.explanation||null,
 difficulty:q.difficulty||meta.difficulty||null,
 source:'generated',
 generated_at:new Date().toISOString(),
-request_id:meta.requestId
+request_id:meta.requestId||null
 }
 }))
+
+const batchDebug={batchIndex,questionCount:batchQuestions.length,vectorSize,chunks:[]}
 for(let i=0;i<points.length;i+=QDRANT_UPSERT_BATCH_SIZE){
 const chunk=points.slice(i,i+QDRANT_UPSERT_BATCH_SIZE)
+const chunkIndex=Math.floor(i/QDRANT_UPSERT_BATCH_SIZE)
 upsertPromises.push(
-qdrant.upsert(QDRANT_GENERATED_QUESTIONS_COLLECTION,{wait:false,points:chunk})
-.then(()=>chunk.length)
+qdrant.upsert(QDRANT_GENERATED_QUESTIONS_COLLECTION,{wait:true,points:chunk})
+.then(()=>{
+log(`Batch ${batchIndex} chunk ${chunkIndex}: upserted ${chunk.length} points`)
+batchDebug.chunks.push({chunkIndex,requested:chunk.length,saved:chunk.length,error:null})
+return chunk.length
+})
 .catch(e=>{
-console.error('[saveGeneratedQuestions upsert]',e.message)
+const errMsg=e.message||'Unknown upsert error'
+log(`Batch ${batchIndex} chunk ${chunkIndex}: FAILED - ${errMsg}`)
+debug.errors.push({stage:'upsert',batch:batchIndex,chunk:chunkIndex,error:errMsg})
+batchDebug.chunks.push({chunkIndex,requested:chunk.length,saved:0,error:errMsg})
 return 0
 })
 )
 }
+batchDebug.ms=Date.now()-batchStartedAt
+debug.batches.push(batchDebug)
 }
+}catch(e){
 const counts=await Promise.all(upsertPromises)
-return counts.reduce((a,b)=>a+b,0)
+debug.savedCount=counts.reduce((a,b)=>a+b,0)
+debug.fatalError=e.message
+debug.finishedAt=new Date().toISOString()
+log(`Fatal error, stopping after saving ${debug.savedCount}/${questions.length}: ${e.message}`)
+const err=new Error(e.message)
+err.debug=debug
+throw err
+}
+
+const counts=await Promise.all(upsertPromises)
+const savedCount=counts.reduce((a,b)=>a+b,0)
+debug.savedCount=savedCount
+debug.finishedAt=new Date().toISOString()
+log(`Finished: saved ${savedCount}/${questions.length}`)
+return {savedCount,totalQuestions:questions.length,debug}
 }
 
 async function deleteGeneratedQuestionsByRequestId(requestId){
@@ -792,6 +901,122 @@ topicConcurrency:TOPIC_CONCURRENCY
 })
 }catch(e){
 res.status(500).json({ok:false,error:e.message})
+}
+})
+
+// Debug helper: tells you whether the generated_questions collection exists,
+// what vector size it was created with, and what vector size the current
+// embedding model actually produces. If sizesMatch is false, that's why
+// saves are failing — recreate the collection or fix EMBEDDING_MODEL_NAME.
+app.get('/api/questions/collection-info',requireAdmin,async(req,res)=>{
+try{
+let exists=true
+let info=null
+try{
+info=await qdrant.getCollection(QDRANT_GENERATED_QUESTIONS_COLLECTION)
+}catch(e){
+exists=false
+}
+let embeddingDim=null
+let embedProbeError=null
+try{
+const vectors=await embedTexts(['__dimension_probe__'])
+embeddingDim=vectors[0]?vectors[0].length:null
+}catch(e){
+embedProbeError=e.message
+}
+const vectorSizeInCollection=(info&&info.config&&info.config.params&&info.config.params.vectors)?info.config.params.vectors.size:null
+res.json({
+collection:QDRANT_GENERATED_QUESTIONS_COLLECTION,
+exists,
+pointsCount:(info&&typeof info.points_count!=='undefined')?info.points_count:null,
+vectorSizeInCollection,
+embeddingModel:EMBEDDING_MODEL_NAME,
+embeddingDim,
+embedProbeError,
+sizesMatch:(exists&&vectorSizeInCollection!=null&&embeddingDim!=null)?vectorSizeInCollection===embeddingDim:null,
+saveGeneratedToQdrant:SAVE_GENERATED_TO_QDRANT,
+upsertBatchSize:QDRANT_UPSERT_BATCH_SIZE,
+saveEmbeddingBatchSize:SAVE_EMBEDDING_BATCH_SIZE
+})
+}catch(e){
+res.status(500).json({error:e.message||'Internal error'})
+}
+})
+
+// Dedicated endpoint to (re)save generated questions to Qdrant, independent
+// of the /generate SSE flow. Pass either:
+//  - { requestId } to load questions from Mongo chat history and save those, or
+//  - { questions:[...], requestId?, examType?, subject?, topic?, chapter?, difficulty? }
+// The full debug breakdown (per-batch, per-chunk, errors) is returned in the
+// JSON response so it is visible in the Network tab.
+app.post('/api/questions/save-to-qdrant',requireAdmin,async(req,res)=>{
+const body=req.body||{}
+const requestId=(body.requestId||'').trim()||null
+let questions=Array.isArray(body.questions)?body.questions:null
+let meta={
+requestId,
+examType:body.examType||null,
+subject:body.subject||null,
+topic:body.topic||null,
+chapter:body.chapter||null,
+difficulty:body.difficulty||null
+}
+let source='body'
+
+try{
+if(!questions&&requestId){
+source='mongo'
+if(!(await connectMongo())){
+return res.status(503).json({error:'MongoDB not configured or unavailable, cannot look up questions by requestId. Pass "questions" directly instead.'})
+}
+const doc=await ChatHistory.findOne({requestId}).lean()
+if(!doc) return res.status(404).json({error:`No chat history found for requestId "${requestId}"`})
+questions=doc.questions||[]
+meta={
+requestId,
+examType:doc.examType||null,
+subject:doc.subject||null,
+topic:doc.topic||null,
+chapter:doc.chapter||null,
+difficulty:doc.difficulty||null
+}
+}
+
+if(!questions||!questions.length){
+return res.status(400).json({error:'No questions to save. Provide a non-empty "questions" array, or a "requestId" that has stored questions in chat history.',source})
+}
+
+const result=await saveGeneratedQuestions(questions,meta)
+
+let mongoUpdateError=null
+if(requestId){
+try{
+if(await connectMongo()){
+await ChatHistory.updateOne({requestId},{$set:{savedToQdrant:result.savedCount}})
+}
+}catch(e){
+mongoUpdateError=e.message
+console.error('[save-to-qdrant mongo backfill]',e.message)
+}
+}
+
+res.json({
+requestId,
+source,
+totalQuestions:result.totalQuestions,
+savedCount:result.savedCount,
+fullyPersisted:result.savedCount===result.totalQuestions,
+mongoUpdateError,
+debug:result.debug
+})
+}catch(e){
+console.error('[save-to-qdrant]',e)
+res.status(500).json({
+error:e.message||'Internal error while saving to Qdrant',
+source,
+debug:e.debug||null
+})
 }
 })
 
@@ -970,10 +1195,13 @@ return {mongoId:doc._id.toString(),mongoError:null}
 
 let savedToQdrant=0
 let qdrantError=null
+let qdrantDebug=null
 if(qdrantOutcome.status==='fulfilled'){
-savedToQdrant=qdrantOutcome.value
+savedToQdrant=qdrantOutcome.value.savedCount
+qdrantDebug=qdrantOutcome.value.debug
 }else{
-qdrantError=qdrantOutcome.reason&&qdrantOutcome.reason.message||'Unknown error saving to Qdrant'
+qdrantError=(qdrantOutcome.reason&&qdrantOutcome.reason.message)||'Unknown error saving to Qdrant'
+qdrantDebug=(qdrantOutcome.reason&&qdrantOutcome.reason.debug)||null
 console.error('[saveGeneratedQuestions]',qdrantError)
 }
 
@@ -987,12 +1215,16 @@ mongoError=mongoOutcome.reason&&mongoOutcome.reason.message||'Unknown error savi
 console.error('[mongo save]',mongoError)
 }
 
+// qdrantDebug is included here so the full per-batch/per-chunk save
+// breakdown is visible in the SSE stream in the Network tab (as an
+// EventStream message on this request), not just in server logs.
 sendEvent('persisted',{
 requestId,
 mongoId,
 savedToQdrant,
 mongoError,
-qdrantError
+qdrantError,
+qdrantDebug
 })
 
 if(mongoId&&savedToQdrant>0){
