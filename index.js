@@ -39,7 +39,6 @@ const QDRANT_GENERATED_QUESTIONS_COLLECTION=process.env.QDRANT_GENERATED_QUESTIO
 
 const ADMIN_API_KEY=process.env.ADMIN_API_KEY
 
-
 const PSMODEL_ENDPOINT=process.env.PSMODEL_ENDPOINT
 const PSMODEL_API_KEY=process.env.PSMODEL_API_KEY
 const PSMODEL_MODEL=process.env.PSMODEL_MODEL
@@ -51,9 +50,7 @@ const PSMODELCHATHISDB_URI=process.env.PSMODELCHATHISDB_URI
 const EMBEDDING_MODEL_NAME=process.env.EMBEDDING_MODEL_NAME||'BAAI/bge-base-en-v1.5'
 const EMBEDDING_CACHE_DIR=process.env.EMBEDDING_CACHE_DIR||path.join(process.cwd(),'.fastembed_cache')
 
-// question_limit is now a TOTAL cap across every topic in a single request (not per-topic).
 const question_limit=parseInt(process.env.QUESTION_LIMIT||'100',10)
-// Max number of distinct topics/subjects allowed in one request, to keep latency/cost sane.
 const MAX_TOPICS=parseInt(process.env.MAX_TOPICS||'8',10)
 const QUESTION_BANK_TOP_K=parseInt(process.env.QUESTION_BANK_TOP_K||'12',10)
 const KNOWLEDGE_BASE_TOP_K=parseInt(process.env.KNOWLEDGE_BASE_TOP_K||'10',10)
@@ -61,9 +58,9 @@ const GENERATION_BATCH_SIZE=parseInt(process.env.GENERATION_BATCH_SIZE||'25',10)
 const TOPIC_CONCURRENCY=parseInt(process.env.TOPIC_CONCURRENCY||'2',10)
 const SAVE_GENERATED_TO_QDRANT=process.env.SAVE_GENERATED_TO_QDRANT!=='false'
 const QDRANT_UPSERT_BATCH_SIZE=parseInt(process.env.QDRANT_UPSERT_BATCH_SIZE||'64',10)
-// How many previously-generated questions (across ALL past requests, found by semantic
-// similarity) to pull in as an "avoid repeating these" reference when generating a topic.
 const GENERATED_DEDUP_TOP_K=parseInt(process.env.GENERATED_DEDUP_TOP_K||'15',10)
+const SAVE_EMBEDDING_BATCH_SIZE=parseInt(process.env.SAVE_EMBEDDING_BATCH_SIZE||'64',10)
+const SSE_HEARTBEAT_MS=parseInt(process.env.SSE_HEARTBEAT_MS||'10000',10)
 
 const qdrant=new QdrantClient({url:QDRANT_URL,apiKey:QDRANT_API_KEY})
 
@@ -76,11 +73,9 @@ topic:String,
 chapter:String,
 keywords:[String],
 difficulty:String,
-// New multi-topic breakdown.
 topics:[mongoose.Schema.Types.Mixed],
 requestedCount:Number,
 generatedCount:Number,
-// True if one or more topics/batches stopped early or failed, so generatedCount < requestedCount.
 partial:{type:Boolean,default:false},
 limitedToQuestionLimit:Boolean,
 questionLimit:Number,
@@ -139,11 +134,11 @@ maxLength:512
 return embedderPromise
 }
 
-async function embedTexts(texts){
+async function embedTexts(texts,batchSize){
 if(!texts||!texts.length) return []
 const embedder=await getEmbedder()
 const out=[]
-for await(const batch of embedder.embed(texts,32)){
+for await(const batch of embedder.embed(texts,batchSize||32)){
 for(const vec of batch) out.push(Array.from(vec))
 }
 return out
@@ -195,10 +190,6 @@ with_payload:true
 return result.points||[]
 }
 
-// Semantic lookup of previously-generated questions, used to build a cross-request "don't
-// repeat these" list so the same topic asked again on a different day doesn't produce near-
-// identical questions. Safe to call before the collection has ever been created (e.g. the very
-// first generation request ever run) - just returns no results instead of throwing.
 async function searchGeneratedQuestions(vector,topK){
 try{
 const result=await qdrant.query(QDRANT_GENERATED_QUESTIONS_COLLECTION,{
@@ -212,12 +203,6 @@ return []
 }
 }
 
-// The question_bank/knowledge_base collections are expected to be pre-populated by the RAG
-// ingestion pipeline, but generated_questions is written to by THIS service and was never
-// created anywhere - so on a fresh Qdrant instance every upsert into it fails with a
-// "collection not found" error that was previously only logged server-side, making saves look
-// like they silently did nothing. This creates it on first use, matching the vector size of
-// whatever embedding model is actually configured (rather than a hardcoded dimension).
 let generatedCollectionEnsured=false
 async function ensureGeneratedQuestionsCollection(vectorSize){
 if(generatedCollectionEnsured) return
@@ -226,7 +211,6 @@ await qdrant.getCollection(QDRANT_GENERATED_QUESTIONS_COLLECTION)
 generatedCollectionEnsured=true
 return
 }catch(e){
-// Fall through - most likely "collection doesn't exist yet".
 }
 try{
 await qdrant.createCollection(QDRANT_GENERATED_QUESTIONS_COLLECTION,{
@@ -234,8 +218,6 @@ vectors:{size:vectorSize,distance:'Cosine'}
 })
 generatedCollectionEnsured=true
 }catch(e){
-// Another concurrent request may have created it first between the check and here - that's
-// fine. Anything else is a real problem and should surface to the caller.
 if(!/already exists|409/i.test(e.message||'')) throw e
 generatedCollectionEnsured=true
 }
@@ -271,10 +253,6 @@ if(start!==-1&&end!==-1&&end>start) cleaned=cleaned.slice(start,end+1)
 return cleaned
 }
 
-// ---- Multi-topic intent extraction ----
-// The admin can now ask for several topics/subjects/difficulties in one message, e.g.
-// "30 Polity questions on Fundamental Rights and 20 tough Geography questions on monsoons".
-// The model returns an array of independent topic "requests" instead of a single object.
 function buildAnalyzePrompt(query){
 const system='You are an intent extraction engine for a Civil Services exam question generation system. Extract structured parameters from the admin natural language request. The request may cover ONE topic or MULTIPLE distinct topics/subjects/difficulty levels in the same message. Always respond with strict JSON only, no markdown, no prose, no code fences.'
 const user=`Admin request: "${query}"
@@ -315,7 +293,6 @@ try{
 const parsed=JSON.parse(cleaned)
 let requests=Array.isArray(parsed.requests)?parsed.requests:null
 if(!requests){
-// Backward-compatible fallback in case the model returns the old flat shape.
 if(parsed.topic||parsed.subject) requests=[parsed]
 }
 if(!requests||!requests.length) return []
@@ -325,8 +302,6 @@ return []
 }
 }
 
-// Merge per-spec fields with request-level fallbacks (body-level overrides apply to every topic
-// unless that topic already specified its own value).
 function applyFallbacks(spec,fallback){
 return {
 count:spec.count,
@@ -339,7 +314,6 @@ difficulty:spec.difficulty||fallback.difficulty||null
 }
 }
 
-// Resolve how many questions each topic should get before the overall limit is applied.
 function resolveSpecCounts(specs,bodyCount){
 const anySpecHasCount=specs.some(s=>Number.isFinite(s.count)&&s.count>0)
 if(specs.length===1){
@@ -363,7 +337,6 @@ if(remainder>0) remainder--
 return specs
 }
 
-// Apply the overall QUESTION_LIMIT across all topics combined, scaling proportionally if needed.
 function applyOverallLimit(specs,limit){
 const totalRequested=specs.reduce((a,s)=>a+s.requestedCount,0)
 if(totalRequested<=limit){
@@ -384,9 +357,6 @@ specs.forEach((s,idx)=>{s.count=scaled[idx]})
 return {limited:true,totalRequested,totalCount:scaled.reduce((a,b)=>a+b,0)}
 }
 
-// NDJSON instead of a JSON array: one object per line. This means a truncated stream or one
-// malformed line only costs that line, not the entire batch — the accumulator below parses
-// and accepts lines as they complete, independent of whatever comes after them.
 function buildPrompt({examType,topic,subject,difficulty,batchCount,pyqText,kbText,avoidList}){
 const exam=examType||'Civil Services'
 const system=`You are a senior ${exam} question setter. Write fresh, original MCQs — never copy or lightly reword the sample previous-year questions below; use them only to match style, tone and difficulty. Use the knowledge base text as the sole factual source. Write each explanation as a direct, self-contained statement of fact — never open with a meta-phrase like "As per the knowledge," "Based on the provided context," or "According to the source." Output NDJSON only: exactly one valid JSON object per line, no surrounding array brackets, no commas between lines, no blank lines, no markdown, no code fences, no numbering, no text before or after the lines.`
@@ -502,8 +472,6 @@ clearTimeout(timer)
 }
 }
 
-// Parses a single NDJSON line into a question object, tolerating a stray trailing comma or
-// accidental code-fence/array-bracket noise the model might still slip in.
 function parseQuestionLine(line){
 let cleaned=(line||'').trim()
 if(!cleaned) return null
@@ -524,15 +492,10 @@ return null
 }
 }
 
-// Normalizes a question stem for duplicate detection: lowercase, strip punctuation, collapse
-// whitespace. Doesn't need to be perfect — it only needs to catch near-identical repeats.
 function normalizeStem(text){
 return (text||'').toLowerCase().replace(/[^a-z0-9\s]/g,'').replace(/\s+/g,' ').trim().slice(0,120)
 }
 
-// Buffers streamed token deltas and emits complete lines to onLine as soon as a newline
-// arrives, so questions can be accepted (and even shown to the user) mid-stream instead of
-// only after the whole batch finishes.
 function createLineAccumulator(onLine){
 let buffer=''
 return {
@@ -552,19 +515,10 @@ buffer=''
 }
 }
 
-// Generates exactly params.batchCount NEW (non-duplicate) questions for one batch, retrying
-// only the shortfall (not the whole batch) up to 2 extra times if lines were dropped, invalid,
-// or duplicates. dedupState is shared across the whole request (all topics, all batches).
 async function generateQuestionsForBatch(params,dedupState,onQuestion){
 let stillNeeded=params.batchCount
 let collected=[]
 for(let attempt=0;attempt<3&&stillNeeded>0;attempt++){
-// Mix in a handful of historical (cross-request) stems alongside ALL of this request's own
-// stems for this topic so far. This used to cap the in-request list at the last 15, which
-// silently forgot anything earlier once a topic needed more than one batch (e.g. 30 requested
-// = a 25-question batch + a 5-question remainder batch - the remainder batch could only see
-// the last 15 of those 25, so the first 10 were invisible and free to repeat). Uncapped here
-// since this only affects prompt input size (cheap), not the output token budget.
 const avoidList=[
 ...dedupState.historicalTexts.slice(-10),
 ...dedupState.recentTexts.slice(-60)
@@ -585,7 +539,6 @@ if(onQuestion) onQuestion(q)
 try{
 await streamPSModel(system,user,delta=>acc.push(delta),maxTokens)
 }catch(e){
-// fall through to flush whatever was collected before the error, then retry the shortfall
 }
 acc.flush()
 stillNeeded=params.batchCount-collected.length
@@ -593,15 +546,6 @@ stillNeeded=params.batchCount-collected.length
 return collected
 }
 
-// Runs an array through `worker` with at most `limit` in flight at once, preserving output
-// order. Used to process several topics concurrently without unbounded parallelism.
-//
-// IMPORTANT: each worker call is individually try/caught. Previously a single rejected worker
-// (e.g. topic 3's embedding/Qdrant lookup failing) would reject the whole Promise.all below,
-// which meant every other topic's already-generated questions - even ones fully finished and
-// already streamed to the client - were discarded and the request ended in a bare error. Now a
-// failing topic is captured as a normal (non-throwing) result so the rest of the request still
-// completes and whatever was generated is still returned.
 async function runWithConcurrency(items,limit,worker){
 const results=new Array(items.length)
 let cursor=0
@@ -629,14 +573,7 @@ await Promise.all(runners)
 return results
 }
 
-// Generates all questions for a single topic spec, in batches of GENERATION_BATCH_SIZE,
-// emitting SSE progress events along the way. dedupState is shared across the whole request
-// so duplicate stems get caught even across different topics/batches.
 async function generateForTopic(spec,sendEvent,topicIndex,totalTopics,dedupState){
-// Setup (embedding + Qdrant lookups) used to be unguarded: if it threw, the exception
-// propagated out of this whole function, which - before runWithConcurrency was hardened -
-// wiped out every other topic's results too. It's now caught here as well, defensively, so
-// this topic just reports itself as failed instead of generating anything.
 let pyqPoints,kbPoints
 try{
 const searchText=buildSearchText(spec)
@@ -648,8 +585,6 @@ searchGeneratedQuestions(queryVector,GENERATED_DEDUP_TOP_K)
 ])
 pyqPoints=pyq
 kbPoints=kb
-// Seed the shared dedup state with questions generated for this same topic area in PAST
-// requests, so they're excluded exactly like duplicates generated earlier in this request.
 for(const p of pastGenerated){
 const stem=normalizeStem(p.payload&&p.payload.question)
 if(!stem||dedupState.seen.has(stem)) continue
@@ -706,18 +641,11 @@ batchQuestions=await generateQuestionsForBatch(params,dedupState,q=>{
 sendEvent('question_ready',{topicIndex,totalTopics,topic:spec.topic,batch:b+1,question:q})
 })
 }catch(e){
-// generateQuestionsForBatch already swallows its own retry errors and returns [] rather
-// than throwing, but guard here too so one bad batch can never take the whole topic down.
 batchQuestions=[]
 }
 
 sendEvent('batch_done',{topicIndex,totalTopics,topic:spec.topic,batch:b+1,totalBatches:batches.length,delivered:batchQuestions.length,requested:batchCount})
 
-// A batch that produced NOTHING after all internal retries means something is
-// systemically wrong (rate limit, outage, bad key) rather than a one-off shortfall.
-// Stop here and hand back everything already generated in prior batches, instead of
-// either losing it (old behavior on a hard crash) or silently grinding through more
-// batches that are likely to fail the same way.
 if(batchQuestions.length===0){
 stoppedEarly=true
 stopReason=`Batch ${b+1} of ${batches.length} produced no questions after retries, so the remaining batches for this topic were skipped.`
@@ -751,11 +679,16 @@ return {spec,questions,pyqReferencesUsed:pyqPoints.length,knowledgeChunksUsed:kb
 async function saveGeneratedQuestions(questions,meta){
 if(!SAVE_GENERATED_TO_QDRANT||!questions.length) return 0
 const texts=questions.map(q=>[q.question,...Object.values(q.options||{})].join(' '))
-const vectors=await embedTexts(texts)
-await ensureGeneratedQuestionsCollection(vectors[0].length)
-const points=questions.map((q,i)=>({
+const embedder=await getEmbedder()
+const upsertPromises=[]
+let offset=0
+for await(const vectorBatch of embedder.embed(texts,SAVE_EMBEDDING_BATCH_SIZE)){
+const batchQuestions=questions.slice(offset,offset+vectorBatch.length)
+offset+=vectorBatch.length
+if(!generatedCollectionEnsured) await ensureGeneratedQuestionsCollection(vectorBatch[0].length)
+const points=batchQuestions.map((q,j)=>({
 id:crypto.randomUUID(),
-vector:vectors[i],
+vector:Array.from(vectorBatch[j]),
 payload:{
 exam:q.examType||meta.examType||null,
 subject:q.subject||meta.subject||null,
@@ -772,10 +705,19 @@ request_id:meta.requestId
 }
 }))
 for(let i=0;i<points.length;i+=QDRANT_UPSERT_BATCH_SIZE){
-const batch=points.slice(i,i+QDRANT_UPSERT_BATCH_SIZE)
-await qdrant.upsert(QDRANT_GENERATED_QUESTIONS_COLLECTION,{wait:true,points:batch})
+const chunk=points.slice(i,i+QDRANT_UPSERT_BATCH_SIZE)
+upsertPromises.push(
+qdrant.upsert(QDRANT_GENERATED_QUESTIONS_COLLECTION,{wait:false,points:chunk})
+.then(()=>chunk.length)
+.catch(e=>{
+console.error('[saveGeneratedQuestions upsert]',e.message)
+return 0
+})
+)
 }
-return points.length
+}
+const counts=await Promise.all(upsertPromises)
+return counts.reduce((a,b)=>a+b,0)
 }
 
 async function deleteGeneratedQuestionsByRequestId(requestId){
@@ -857,7 +799,6 @@ app.post('/api/questions/generate',requireAdmin,async(req,res)=>{
 const body=req.body||{}
 const query=(body.query||'').trim()
 
-// Explicit per-topic overrides from the client take priority over NL parsing.
 const explicitTopics=Array.isArray(body.topics)?body.topics.map(normalizeSpec).filter(s=>s.topic):null
 
 if(!query&&!(body.topic||'').trim()&&!(explicitTopics&&explicitTopics.length)){
@@ -870,10 +811,6 @@ res.setHeader('Connection','keep-alive')
 res.setHeader('X-Accel-Buffering','no')
 res.flushHeaders()
 
-// If the client disconnects mid-stream (closed tab, lost network), writing to `res` afterwards
-// emits an 'error' event on the stream - with no listener that becomes an unhandled exception
-// and, per the safety net above, would otherwise be one more way to bring the whole server down
-// over something as ordinary as someone closing a browser tab mid-generation.
 res.on('error',(err)=>{
 console.error('[response stream error]',err.message)
 })
@@ -886,21 +823,12 @@ console.error('[sendEvent write failed]',e.message)
 }
 }
 
-// Generation itself sends frequent events, so the connection never goes idle. But the SAVE step
-// right after 'done' - embedding all the just-generated questions, upserting them into Qdrant,
-// writing the Mongo record - can run for many seconds with zero bytes written to the client, and
-// many reverse proxies / load balancers (nginx, ALBs, PaaS platforms) will silently kill an HTTP
-// connection after ~30-60s of no data. That's the most likely cause of a "network error" that
-// shows up specifically right after a big (e.g. 80-question) generation finishes: the response
-// looked idle right when the save was actually doing the most work. A ": comment" line is valid
-// SSE (ignored by the client's parser, doesn't fire any event) and is enough to keep it alive.
 const heartbeat=setInterval(()=>{
 try{
 res.write(': keep-alive\n\n')
 }catch(e){
-// ignore - the res.on('error') listener above already logs real connection problems
 }
-},15000)
+},SSE_HEARTBEAT_MS)
 
 const requestId=crypto.randomUUID()
 
@@ -967,10 +895,6 @@ limitedToQuestionLimit:limited,
 limitMessage
 })
 
-// Shared across every topic/batch in this request so duplicate stems get caught even when
-// they show up under a different topic (common when topics overlap, e.g. two Polity subtopics).
-// historicalTexts is populated per-topic from past requests (see generateForTopic) so repeats
-// are also caught across different generation sessions, not just within this one.
 const dedupState={seen:new Set(),recentTexts:[],historicalTexts:[]}
 const results=await runWithConcurrency(
 specs,
@@ -982,8 +906,6 @@ let questions=results.flatMap(r=>r.questions||[])
 const pyqReferencesUsed=results.reduce((a,r)=>a+(r.pyqReferencesUsed||0),0)
 const knowledgeChunksUsed=results.reduce((a,r)=>a+(r.knowledgeChunksUsed||0),0)
 
-// Per-topic status so the client can show exactly what finished, what was partial, and why -
-// instead of an all-or-nothing success/error.
 const topicsResult=specs.map((s,i)=>{
 const r=results[i]||{}
 return {
@@ -1012,8 +934,6 @@ topics:topicsResult,
 questions
 })
 
-// Run both saves concurrently (they're independent) rather than back-to-back, which roughly
-// halves how long the connection sits silent right when the heartbeat above matters most.
 const [qdrantOutcome,mongoOutcome]=await Promise.allSettled([
 saveGeneratedQuestions(questions,{requestId,examType:specs[0].examType,subject:specs[0].subject,topic:specs[0].topic,chapter:specs[0].chapter,difficulty:specs[0].difficulty}),
 (async()=>{
@@ -1042,8 +962,6 @@ pyqReferencesUsed,
 knowledgeChunksUsed,
 questions,
 model:PSMODEL_MODEL,
-// savedToQdrant isn't known yet since this runs concurrently with the Qdrant save above -
-// left as 0 here; it's a display-only convenience field and not load-bearing anywhere.
 savedToQdrant:0
 })
 return {mongoId:doc._id.toString(),mongoError:null}
