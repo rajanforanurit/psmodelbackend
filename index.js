@@ -69,6 +69,13 @@ const MAX_TOPICS=parseInt(process.env.MAX_TOPICS||'8',10)
 const QUESTION_BANK_TOP_K=parseInt(process.env.QUESTION_BANK_TOP_K||'12',10)
 const KNOWLEDGE_BASE_TOP_K=parseInt(process.env.KNOWLEDGE_BASE_TOP_K||'10',10)
 const GENERATION_BATCH_SIZE=parseInt(process.env.GENERATION_BATCH_SIZE||'25',10)
+// Target difficulty mix used whenever the admin doesn't explicitly ask for a specific
+// difficulty. Must roughly sum to 1 (they don't need to be exact — buildDifficultyPlan
+// normalizes via floor+remainder distribution). Override via env if a different split
+// (e.g. more Moderate-leaning, closer to a real exam paper) is wanted later.
+const DIFFICULTY_MIX_EASY=parseFloat(process.env.DIFFICULTY_MIX_EASY||'0.33')
+const DIFFICULTY_MIX_MODERATE=parseFloat(process.env.DIFFICULTY_MIX_MODERATE||'0.34')
+const DIFFICULTY_MIX_DIFFICULT=parseFloat(process.env.DIFFICULTY_MIX_DIFFICULT||'0.33')
 const TOPIC_CONCURRENCY=parseInt(process.env.TOPIC_CONCURRENCY||'2',10)
 const QDRANT_UPSERT_BATCH_SIZE=parseInt(process.env.QDRANT_UPSERT_BATCH_SIZE||'64',10)
 const GENERATED_DEDUP_TOP_K=parseInt(process.env.GENERATED_DEDUP_TOP_K||'15',10)
@@ -96,7 +103,8 @@ pyqReferencesUsed:Number,
 knowledgeChunksUsed:Number,
 questions:[mongoose.Schema.Types.Mixed],
 model:String,
-savedToQdrant:Number
+savedToQdrant:Number,
+stats:mongoose.Schema.Types.Mixed
 },{timestamps:true})
 
 const ChatHistory=mongoose.models.ChatHistory||mongoose.model('ChatHistory',chatHistorySchema,'psmodel_chat_history')
@@ -480,30 +488,130 @@ if(!batchCount||batchCount<5) return 0
 return clamp(Math.round(batchCount*0.18),4,5)
 }
 
-function buildPrompt({examType,topic,subject,difficulty,batchCount,pyqText,kbText,avoidList}){
+const DIFFICULTY_LEVELS=['Easy','Moderate','Difficult']
+
+// Builds an exact, shuffled, per-question difficulty assignment for a batch.
+// If the admin explicitly asked for a difficulty, every slot is that value
+// (unchanged behaviour). Otherwise the batch is split across Easy/Moderate/
+// Difficult according to DIFFICULTY_MIX_* and randomly ordered, so results
+// aren't skewed toward one level (this used to happen because the prompt's
+// fallback text literally said "Moderate, matching the exam standard" when
+// no difficulty was given — that's what was causing ~78% Moderate).
+function buildDifficultyPlan(count,fixedDifficulty){
+if(!count||count<1) return []
+const normalizedFixed=(fixedDifficulty||'').trim()
+if(normalizedFixed) return new Array(count).fill(normalizedFixed)
+
+const ratios={Easy:DIFFICULTY_MIX_EASY,Moderate:DIFFICULTY_MIX_MODERATE,Difficult:DIFFICULTY_MIX_DIFFICULT}
+const raw=DIFFICULTY_LEVELS.map(level=>count*(ratios[level]||0))
+const counts=raw.map(n=>Math.floor(n))
+let remainder=count-counts.reduce((a,b)=>a+b,0)
+const fracOrder=raw
+.map((n,i)=>({i,frac:n-Math.floor(n)}))
+.sort((a,b)=>b.frac-a.frac)
+let cursor=0
+while(remainder>0&&fracOrder.length){
+counts[fracOrder[cursor%fracOrder.length].i]++
+remainder--
+cursor++
+}
+
+const plan=[]
+DIFFICULTY_LEVELS.forEach((level,i)=>{
+for(let k=0;k<counts[i];k++) plan.push(level)
+})
+
+for(let i=plan.length-1;i>0;i--){
+const j=crypto.randomInt(0,i+1)
+;[plan[i],plan[j]]=[plan[j],plan[i]]
+}
+return plan
+}
+
+// Fisher-Yates-shuffles a question's option VALUES across the fixed A/B/C/D
+// key set (English and Hindi kept in lockstep so both languages still refer
+// to the same underlying option), and updates correct_answer to point at
+// wherever the correct value landed. This is a hard programmatic guarantee
+// against the "correct answer is almost always A" bias models tend to have —
+// prompting alone (asking the model to "vary the answer") is not reliable
+// enough on its own, so this runs on every accepted question regardless of
+// what the model produced.
+function shuffleQuestionOptions(q){
+const keys=Object.keys(q.options||{})
+if(keys.length<2) return q
+const correctKey=(q.correct_answer||'').trim().toUpperCase()
+const correctIndex=keys.indexOf(correctKey)
+if(correctIndex===-1) return q
+
+const order=keys.map((_,i)=>i)
+for(let i=order.length-1;i>0;i--){
+const j=crypto.randomInt(0,i+1)
+;[order[i],order[j]]=[order[j],order[i]]
+}
+
+const hasHindi=q.hindi_options&&typeof q.hindi_options==='object'
+const newOptions={}
+const newHindiOptions=hasHindi?{}:null
+keys.forEach((key,i)=>{
+const sourceKey=keys[order[i]]
+newOptions[key]=q.options[sourceKey]
+if(newHindiOptions) newHindiOptions[key]=q.hindi_options[sourceKey]
+})
+
+q.options=newOptions
+if(newHindiOptions) q.hindi_options=newHindiOptions
+const newCorrectPos=order.indexOf(correctIndex)
+q.correct_answer=keys[newCorrectPos]
+return q
+}
+
+function computeQuestionStats(questions){
+const answerCounts={A:0,B:0,C:0,D:0}
+const difficultyCounts={}
+questions.forEach(q=>{
+const ans=(q.correct_answer||'').trim().toUpperCase()
+if(answerCounts[ans]!==undefined) answerCounts[ans]++
+const diff=q.difficulty||'Unspecified'
+difficultyCounts[diff]=(difficultyCounts[diff]||0)+1
+})
+return {answerCounts,difficultyCounts,total:questions.length}
+}
+
+function buildPrompt({examType,topic,subject,difficulty,batchCount,pyqText,kbText,avoidList,difficultyPlan}){
 const exam=examType||'Competitive Exam'
 const statementEligible=isStatementBasedExam(examType)
 const statementCount=computeStatementCount(batchCount,statementEligible)
+
+const plan=(difficultyPlan&&difficultyPlan.length===batchCount)?difficultyPlan:buildDifficultyPlan(batchCount,difficulty)
+const difficultyList=plan.map((d,i)=>`${i+1}. ${d}`).join('\n')
+const difficultyIsFixed=!!(difficulty||'').trim()
 
 const styleBlock=statementEligible&&statementCount>0
 ?`This is a ${exam} style paper. Out of the ${batchCount} questions, exactly ${statementCount} must be long, analytical statement-based questions in the classic UPSC/State PCS pattern: present 2 to 4 numbered statements (Statement I, Statement II, ...) about the topic, and ask something like "Which of the statements given above is/are correct?" with options such as "A) 1 only  B) 2 only  C) Both 1 and 2  D) Neither 1 nor 2". Set "statement_based":true on those questions only. The remaining ${batchCount-statementCount} questions must be regular, direct, single-statement MCQs with "statement_based":false.`
 :`This is a ${exam} style paper. Keep every question a direct, single-statement factual or conceptual MCQ typical of ${exam} — do NOT use the multi-statement "which of the statements given above is/are correct" format. Set "statement_based":false on every question.`
 
-const system=`You are a senior ${exam} question setter writing for an exam-prep platform that serves many exam categories (UPSC, State PCS, SSC, Banking, Railways, Teaching, Defence, and more), so match the tone, length and difficulty conventions of the specific exam named below rather than defaulting to a UPSC style. Write fresh, original MCQs — never copy or lightly reword the sample previous-year questions below; use them only to match style, tone and difficulty. Use the knowledge base text as the sole factual source. Also provide an accurate, natural Hindi translation of the question, every option, and the explanation — real translation, not transliteration; commonly-used technical terms, proper nouns and numerals may stay as they conventionally appear in Hindi exam papers. Write each explanation (English and Hindi) as a direct, self-contained statement of fact — never open with a meta-phrase like "As per the knowledge," "Based on the provided context," or "इस संदर्भ के अनुसार". Output NDJSON only: exactly one valid JSON object per line, no surrounding array brackets, no commas between lines, no blank lines, no markdown, no code fences, no numbering, no text before or after the lines.`
+const system=`You are a senior ${exam} question setter writing for an exam-prep platform that serves many exam categories (UPSC, State PCS, SSC, Banking, Railways, Teaching, Defence, and more), so match the tone, length and difficulty conventions of the specific exam named below rather than defaulting to a UPSC style. Write fresh, original MCQs — never copy or lightly reword the sample previous-year questions below; use them only to match style, tone and difficulty. Use the knowledge base text as the sole factual source. Also provide an accurate, natural Hindi translation of the question, every option, and the explanation — real translation, not transliteration; commonly-used technical terms, proper nouns and numerals may stay as they conventionally appear in Hindi exam papers. Write each explanation (English and Hindi) as a direct, self-contained statement of fact — never open with a meta-phrase like "As per the knowledge," "Based on the provided context," or "इस संदर्भ के अनुसार". Vary which option letter (A, B, C or D) holds the correct answer from question to question — never default to A out of habit. Output NDJSON only: exactly one valid JSON object per line, no surrounding array brackets, no commas between lines, no blank lines, no markdown, no code fences, no numbering, no text before or after the lines.`
 
 const avoidBlock=(avoidList&&avoidList.length)?`\nDo not repeat or closely rephrase any of these already-used question stems:\n${avoidList.map(s=>`- ${s}`).join('\n')}\n`:''
+
+const difficultyBlock=difficultyIsFixed
+?`Difficulty: every question must be "${difficulty}".`
+:`Required difficulty for each question, in order (line 1 = first question, line 2 = second question, etc.) — this was requested as a balanced, unspecified mix, so match it exactly rather than defaulting to Moderate:
+${difficultyList}
+An "Easy" question should be answerable from direct recall of a single fact. A "Moderate" question should require connecting two related facts or a short inference. A "Difficult" question should require multi-step reasoning, fine distinctions between close options, or synthesis across sub-topics — not just longer wording.`
 
 const user=`Topic: ${topic}
 Subject: ${subject||'General Studies'}
 Exam: ${exam}
-Difficulty: ${difficulty||'Moderate, matching the exam standard'}
+${difficultyBlock}
 ${styleBlock}
-Generate exactly ${batchCount} new original MCQs. Output exactly ${batchCount} lines, each a standalone JSON object in this exact shape:
+Generate exactly ${batchCount} new original MCQs, in the same order as the difficulty list above. Output exactly ${batchCount} lines, each a standalone JSON object in this exact shape:
 {"question":"...","options":{"A":"...","B":"...","C":"...","D":"..."},"correct_answer":"A","explanation":"...","hindi_question":"...","hindi_options":{"A":"...","B":"...","C":"...","D":"..."},"hindi_explanation":"...","statement_based":false,"difficulty":"Easy|Moderate|Difficult","topic":"${topic}","subject":"${subject||''}"}
 
 Rules:
 - "options" and "hindi_options" must have exactly the same four keys (A, B, C, D) in the same order; each hindi_options value is the Hindi translation of the matching options value.
-- "correct_answer" is always the English option letter (A, B, C or D).
+- "correct_answer" is always the English option letter (A, B, C or D). Spread correct answers roughly evenly across A, B, C and D over the ${batchCount} questions — do not cluster them on one letter.
+- The "difficulty" field on each line must match its required difficulty above.
 - "hindi_question" and "hindi_explanation" must never be empty — always fill them in.
 ${avoidBlock}
 Previous year questions (style/pattern/difficulty reference only, do not copy):
@@ -629,6 +737,7 @@ if(!obj.options||typeof obj.options!=='object'||!Object.keys(obj.options).length
 // so nothing is lost, it just costs one more attempt.
 if(typeof obj.hindi_question!=='string'||!obj.hindi_question.trim()) return null
 if(!obj.hindi_options||typeof obj.hindi_options!=='object'||!Object.keys(obj.hindi_options).length) return null
+shuffleQuestionOptions(obj)
 return obj
 }catch(e){
 return null
@@ -661,12 +770,20 @@ buffer=''
 async function generateQuestionsForBatch(params,dedupState,onQuestion){
 let stillNeeded=params.batchCount
 let collected=[]
+// Built once, sized to the full batch target, and consumed one slot per
+// ACCEPTED question (not per raw line) — so it stays exactly in sync with
+// `collected` across retries regardless of how many lines get rejected or
+// deduped along the way. This is what guarantees the final saved batch has
+// a balanced difficulty spread instead of drifting toward whatever the
+// model defaults to.
+const difficultyPlan=buildDifficultyPlan(params.batchCount,params.difficulty)
+let planCursor=0
 for(let attempt=0;attempt<3&&stillNeeded>0;attempt++){
 const avoidList=[
 ...dedupState.historicalTexts.slice(-10),
 ...dedupState.recentTexts.slice(-60)
 ]
-const passParams={...params,batchCount:stillNeeded,avoidList}
+const passParams={...params,batchCount:stillNeeded,avoidList,difficultyPlan:difficultyPlan.slice(planCursor)}
 // Bilingual output (English + Hindi) roughly doubles the tokens per
 // question versus English-only, so the per-question budget is raised
 // accordingly (was *230+300).
@@ -679,6 +796,8 @@ const stem=normalizeStem(q.question)
 if(dedupState.seen.has(stem)) return
 dedupState.seen.add(stem)
 dedupState.recentTexts.push(q.question.slice(0,140))
+q.difficulty=difficultyPlan[planCursor]||q.difficulty||'Moderate'
+planCursor++
 collected.push(q)
 if(onQuestion) onQuestion(q)
 })
@@ -1435,6 +1554,8 @@ failed:!!r.failed
 })
 const partial=topicsResult.some(t=>t.stoppedEarly||t.failed)
 
+const stats=computeQuestionStats(questions)
+
 sendEvent('done',{
 requestId,
 batchId:requestId,
@@ -1442,7 +1563,8 @@ generatedCount:questions.length,
 totalTopics:specs.length,
 partial,
 topics:topicsResult,
-questions
+questions,
+stats
 })
 
 // Chat history is still saved automatically for audit/history purposes.
@@ -1474,7 +1596,8 @@ pyqReferencesUsed,
 knowledgeChunksUsed,
 questions,
 model:PSMODEL_MODEL,
-savedToQdrant:0
+savedToQdrant:0,
+stats
 })
 mongoId=doc._id.toString()
 }else{
