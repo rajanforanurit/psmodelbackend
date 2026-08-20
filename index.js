@@ -42,23 +42,13 @@ const ADMIN_API_KEY=process.env.ADMIN_API_KEY
 const PSMODEL_ENDPOINT=process.env.PSMODEL_ENDPOINT
 const PSMODEL_API_KEY=process.env.PSMODEL_API_KEY
 const PSMODEL_MODEL=process.env.PSMODEL_MODEL
-// Bumped default vs. the original 60s: bilingual (English+Hindi) output, plus
-// long statement-based questions for UPSC/PCS topics, roughly doubles the
-// tokens per question, so generation legitimately takes longer.
 const PSMODEL_TIMEOUT_MS=parseInt(process.env.PSMODEL_TIMEOUT_MS||'120000',10)
 const PSMODEL_TEMPERATURE=parseFloat(process.env.PSMODEL_TEMPERATURE||'0.7')
 
 const PSMODELCHATHISDB_URI=process.env.PSMODELCHATHISDB_URI
 
-// Cluster for the "predicted questions" collection the admin panel can push
-// reviewed/generated questions into. Separate from PSMODELCHATHISDB_URI,
-// which only stores generation chat history/audit records.
 const PREDICTQUES_URI=process.env.PREDICTQUES_URI
 
-// The predicted-questions schema stores correct_answer as a Number, while the
-// model still answers with an option letter (A/B/C/D) internally. This is the
-// index the letter "A" maps to. Default 0 (A=0,B=1,C=2,D=3). Flip to '1' via
-// env if your frontend expects 1-based indices instead.
 const PREDICTED_ANSWER_INDEX_BASE=parseInt(process.env.PREDICTED_ANSWER_INDEX_BASE||'0',10)
 
 const EMBEDDING_MODEL_NAME=process.env.EMBEDDING_MODEL_NAME||'BAAI/bge-base-en-v1.5'
@@ -69,10 +59,6 @@ const MAX_TOPICS=parseInt(process.env.MAX_TOPICS||'8',10)
 const QUESTION_BANK_TOP_K=parseInt(process.env.QUESTION_BANK_TOP_K||'12',10)
 const KNOWLEDGE_BASE_TOP_K=parseInt(process.env.KNOWLEDGE_BASE_TOP_K||'10',10)
 const GENERATION_BATCH_SIZE=parseInt(process.env.GENERATION_BATCH_SIZE||'25',10)
-// Target difficulty mix used whenever the admin doesn't explicitly ask for a specific
-// difficulty. Must roughly sum to 1 (they don't need to be exact — buildDifficultyPlan
-// normalizes via floor+remainder distribution). Override via env if a different split
-// (e.g. more Moderate-leaning, closer to a real exam paper) is wanted later.
 const DIFFICULTY_MIX_EASY=parseFloat(process.env.DIFFICULTY_MIX_EASY||'0.33')
 const DIFFICULTY_MIX_MODERATE=parseFloat(process.env.DIFFICULTY_MIX_MODERATE||'0.34')
 const DIFFICULTY_MIX_DIFFICULT=parseFloat(process.env.DIFFICULTY_MIX_DIFFICULT||'0.33')
@@ -143,18 +129,8 @@ return false
 return mongoConnectPromise
 }
 
-// ---------------------------------------------------------------------------
-// Predicted-questions cluster (separate Mongo cluster from chat history).
-// Schema matches exactly what the app/frontend expects. Notes on the two
-// small deviations from the schema you pasted:
-//  - No custom `_id: Number` field: Mongo's default ObjectId is used instead,
-//    so nothing needs to be generated/tracked manually on our side.
-//  - `exam`, `year` and `paper` are kept (they're useful for filtering by
-//    exam category later) but are no longer `required` — generated/predicted
-//    questions aren't tied to a specific past sitting the way PYQs are.
-// ---------------------------------------------------------------------------
 const predictedQuestionSchema=new mongoose.Schema({
-exam:{type:String,trim:true},
+exam:{type:String,required:true,trim:true},
 year:{type:Number},
 paper:{type:String,trim:true},
 subject:{type:String,required:true,trim:true},
@@ -301,12 +277,6 @@ return []
 
 let generatedCollectionEnsured=false
 
-// Checks (and creates if missing) the generated_questions collection.
-// IMPORTANT: this now also validates that an *existing* collection's vector
-// size actually matches what the current embedding model produces. A silent
-// mismatch here (e.g. collection created under a different EMBEDDING_MODEL_NAME
-// in the past) is the most common cause of every upsert failing with a cryptic
-// Qdrant error, so we surface it as a clear, descriptive error instead.
 async function ensureGeneratedQuestionsCollection(vectorSize,log){
 const debugLog=log||(()=>{})
 if(generatedCollectionEnsured) return
@@ -470,18 +440,44 @@ specs.forEach((s,idx)=>{s.count=scaled[idx]})
 return {limited:true,totalRequested,totalCount:scaled.reduce((a,b)=>a+b,0)}
 }
 
-// Exams where the classic "Statement I / Statement II ... which of the
-// statements given above is/are correct" analytical question format is
-// standard (UPSC Prelims/Mains and State PCS). Other exam categories (SSC,
-// Banking, Railways, Teaching, Defence, etc.) generally use direct,
-// single-statement MCQs, so they're excluded from this pattern.
 function isStatementBasedExam(examType){
 return /\b(upsc|ias|ips|ifs|civil\s*services?|\bpcs\b|bpsc|uppsc|mppsc|rpsc|opsc|wbpsc|jpsc|hpsc|mpsc|tnpsc|kpsc|state\s*psc|state\s*service\s*commission)\b/i.test(examType||'')
 }
 
-// Roughly 4-5 long statement-based questions per batch, only for
-// UPSC/PCS-style exams, and only when the batch is big enough for that to
-// make sense.
+const EXAM_ALIASES=[
+{canonical:'BPSC TRE',patterns:[/bpsc[\s-]*tre/i,/bihar\s+teacher\s+recruitment/i,/bihar\s+teacher\s+exam/i]},
+{canonical:'BPSC',patterns:[/\bbpsc\b/i,/bihar\s+public\s+service\s+commission/i,/bihar\s+psc\b/i]},
+{canonical:'CGPSC',patterns:[/\bcgpsc\b/i,/chhattisgarh\s+(public\s+service\s+commission|psc)\b/i]},
+{canonical:'HCS',patterns:[/\bhcs\b/i,/haryana\s+civil\s+services?\b/i]},
+{canonical:'HPSC',patterns:[/\bhpsc\b/i,/haryana\s+public\s+service\s+commission/i]},
+{canonical:'HTET',patterns:[/\bhtet\b/i,/haryana\s+(tet|teacher\s+eligibility)/i]},
+{canonical:'IBPS PO',patterns:[/\bibps\s*po\b/i,/\bibps\b/i]},
+{canonical:'JPSC',patterns:[/\bjpsc\b/i,/jharkhand\s+(public\s+service\s+commission|psc)\b/i]},
+{canonical:'MPPSC',patterns:[/\bmppsc\b/i,/\bmppcs\b/i,/madhya\s+pradesh\s+(public\s+service\s+commission|psc)\b/i]},
+{canonical:'MPSC',patterns:[/\bmpsc\b/i,/maharashtra\s+(public\s+service\s+commission|psc)\b/i,/gazetted\s+civil\s+services?\s+prelims/i]},
+{canonical:'RAS',patterns:[/\bras\b/i,/rajasthan\s+administrative\s+service/i]},
+{canonical:'REET',patterns:[/\breet\b/i,/rajasthan\s+eligibility\s+examination\s+for\s+teachers/i]},
+{canonical:'RPSC',patterns:[/\brpsc\b/i,/rajasthan\s+public\s+service\s+commission/i]},
+{canonical:'RRB NTPC',patterns:[/\brrb\s*ntpc\b/i,/railway\s+recruitment\s+board/i,/\bntpc\b/i]},
+{canonical:'SBI PO',patterns:[/\bsbi\s*po\b/i]},
+{canonical:'SSC CGL',patterns:[/\bssc\s*cgl\b/i,/staff\s+selection\s+commission/i]},
+{canonical:'UKPCS',patterns:[/\bukpcs\b/i,/\bukpsc\b/i,/uttarakhand\s+(public\s+service\s+commission|psc)\b/i]},
+{canonical:'UPPCS',patterns:[/\buppcs\b/i,/\buppsc\b/i,/uttar\s+pradesh\s+(public\s+service\s+commission|psc)\b/i]},
+{canonical:'UPTET',patterns:[/\buptet\b/i,/up\s+teacher\s+eligibility/i]},
+{canonical:'UPSC',patterns:[/\bupsc\b/i,/union\s+public\s+service\s+commission/i,/civil\s+services?\s+exam/i,/\bias\b/i,/\bips\b/i,/\bifs\b/i]}
+]
+
+function detectExamTypeFromText(text){
+const t=(text||'').trim()
+if(!t) return null
+for(const entry of EXAM_ALIASES){
+for(const re of entry.patterns){
+if(re.test(t)) return entry.canonical
+}
+}
+return null
+}
+
 function computeStatementCount(batchCount,statementEligible){
 if(!statementEligible) return 0
 if(!batchCount||batchCount<5) return 0
@@ -490,13 +486,6 @@ return clamp(Math.round(batchCount*0.18),4,5)
 
 const DIFFICULTY_LEVELS=['Easy','Moderate','Difficult']
 
-// Builds an exact, shuffled, per-question difficulty assignment for a batch.
-// If the admin explicitly asked for a difficulty, every slot is that value
-// (unchanged behaviour). Otherwise the batch is split across Easy/Moderate/
-// Difficult according to DIFFICULTY_MIX_* and randomly ordered, so results
-// aren't skewed toward one level (this used to happen because the prompt's
-// fallback text literally said "Moderate, matching the exam standard" when
-// no difficulty was given — that's what was causing ~78% Moderate).
 function buildDifficultyPlan(count,fixedDifficulty){
 if(!count||count<1) return []
 const normalizedFixed=(fixedDifficulty||'').trim()
@@ -528,14 +517,6 @@ const j=crypto.randomInt(0,i+1)
 return plan
 }
 
-// Fisher-Yates-shuffles a question's option VALUES across the fixed A/B/C/D
-// key set (English and Hindi kept in lockstep so both languages still refer
-// to the same underlying option), and updates correct_answer to point at
-// wherever the correct value landed. This is a hard programmatic guarantee
-// against the "correct answer is almost always A" bias models tend to have —
-// prompting alone (asking the model to "vary the answer") is not reliable
-// enough on its own, so this runs on every accepted question regardless of
-// what the model produced.
 function shuffleQuestionOptions(q){
 const keys=Object.keys(q.options||{})
 if(keys.length<2) return q
@@ -731,10 +712,6 @@ try{
 const obj=JSON.parse(cleaned)
 if(!obj||typeof obj.question!=='string'||!obj.question.trim()) return null
 if(!obj.options||typeof obj.options!=='object'||!Object.keys(obj.options).length) return null
-// Bilingual is now mandatory. If the model skipped the Hindi fields on a
-// given line, reject the line — the existing retry loop in
-// generateQuestionsForBatch will simply ask for that many more questions,
-// so nothing is lost, it just costs one more attempt.
 if(typeof obj.hindi_question!=='string'||!obj.hindi_question.trim()) return null
 if(!obj.hindi_options||typeof obj.hindi_options!=='object'||!Object.keys(obj.hindi_options).length) return null
 shuffleQuestionOptions(obj)
@@ -770,12 +747,6 @@ buffer=''
 async function generateQuestionsForBatch(params,dedupState,onQuestion){
 let stillNeeded=params.batchCount
 let collected=[]
-// Built once, sized to the full batch target, and consumed one slot per
-// ACCEPTED question (not per raw line) — so it stays exactly in sync with
-// `collected` across retries regardless of how many lines get rejected or
-// deduped along the way. This is what guarantees the final saved batch has
-// a balanced difficulty spread instead of drifting toward whatever the
-// model defaults to.
 const difficultyPlan=buildDifficultyPlan(params.batchCount,params.difficulty)
 let planCursor=0
 for(let attempt=0;attempt<3&&stillNeeded>0;attempt++){
@@ -784,9 +755,6 @@ const avoidList=[
 ...dedupState.recentTexts.slice(-60)
 ]
 const passParams={...params,batchCount:stillNeeded,avoidList,difficultyPlan:difficultyPlan.slice(planCursor)}
-// Bilingual output (English + Hindi) roughly doubles the tokens per
-// question versus English-only, so the per-question budget is raised
-// accordingly (was *230+300).
 const maxTokens=clamp(stillNeeded*450+400,800,24000)
 const {system,user}=buildPrompt(passParams)
 const acc=createLineAccumulator(line=>{
@@ -924,7 +892,8 @@ completedBatches++
 questions=questions.slice(0,spec.count).map(q=>({
 ...q,
 topic:q.topic||spec.topic,
-subject:q.subject||spec.subject||null
+subject:q.subject||spec.subject||null,
+examType:q.examType||spec.examType||null
 }))
 
 sendEvent('topic_done',{
@@ -941,14 +910,6 @@ stopReason
 return {spec,questions,pyqReferencesUsed:pyqPoints.length,knowledgeChunksUsed:kbPoints.length,stoppedEarly,stopReason}
 }
 
-// Saves generated questions to Qdrant with full debug instrumentation.
-// Returns {savedCount, totalQuestions, debug} — debug always contains a
-// per-batch/per-chunk breakdown plus any errors encountered, so it can be
-// surfaced directly in an API response or an SSE event and inspected in
-// the browser Network tab instead of only appearing in server logs.
-// NOTE: this is now ONLY ever called manually via
-// POST /api/questions/save-to-qdrant — the /generate flow no longer calls
-// this automatically.
 async function saveGeneratedQuestions(questions,meta){
 const debug={
 requestId:meta.requestId||null,
@@ -1016,7 +977,9 @@ const points=batchQuestions.map((q,j)=>({
 id:crypto.randomUUID(),
 vector:Array.from(vectorBatch[j]),
 payload:{
-exam:q.examType||meta.examType||null,
+exam:q.examType||meta.examType||
+detectExamTypeFromText([meta.adminQuery,meta.subject,meta.topic,q.subject,q.topic].filter(Boolean).join(' '))||
+null,
 subject:q.subject||meta.subject||null,
 topic:q.topic||meta.topic||null,
 chapter:q.chapter||meta.chapter||null,
@@ -1086,10 +1049,6 @@ wait:true
 return result
 }
 
-// Maps the model's English option letter (A/B/C/D) onto a numeric index for
-// the predicted-questions schema, where correct_answer is a Number. Keys are
-// sorted first so the mapping is stable even if key insertion order ever
-// varies. See PREDICTED_ANSWER_INDEX_BASE above to switch 0-based/1-based.
 function letterToOptionIndex(letter,optionsObj){
 if(!letter||!optionsObj) return null
 const keys=Object.keys(optionsObj).sort()
@@ -1098,13 +1057,14 @@ if(pos===-1) return null
 return pos+PREDICTED_ANSWER_INDEX_BASE
 }
 
-// Transforms one generated question (our internal NDJSON shape) into a
-// document matching the predicted-questions Mongo schema.
 function buildPredictedDoc(q,meta,batchId){
 const englishOptions=q.options||{}
 const hindiOptions=q.hindi_options||{}
+const resolvedExam=q.examType||meta.examType||
+detectExamTypeFromText([meta.adminQuery,meta.subject,meta.topic,q.subject,q.topic].filter(Boolean).join(' '))||
+null
 return {
-exam:q.examType||meta.examType||null,
+exam:resolvedExam,
 subject:q.subject||meta.subject||null,
 topic:q.topic||meta.topic||null,
 imageUrl:q.imageUrl||null,
@@ -1195,10 +1155,6 @@ res.status(500).json({ok:false,error:e.message})
 }
 })
 
-// Debug helper: tells you whether the generated_questions collection exists,
-// what vector size it was created with, and what vector size the current
-// embedding model actually produces. If sizesMatch is false, that's why
-// saves are failing — recreate the collection or fix EMBEDDING_MODEL_NAME.
 app.get('/api/questions/collection-info',requireAdmin,async(req,res)=>{
 try{
 let exists=true
@@ -1234,14 +1190,6 @@ res.status(500).json({error:e.message||'Internal error'})
 }
 })
 
-// Dedicated endpoint to (re)save generated questions to Qdrant, independent
-// of the /generate SSE flow. This is now the ONLY way questions land in the
-// generated_questions Qdrant collection — /generate no longer does this
-// automatically. Pass either:
-//  - { requestId } to load questions from Mongo chat history and save those, or
-//  - { questions:[...], requestId?, examType?, subject?, topic?, chapter?, difficulty? }
-// The full debug breakdown (per-batch, per-chunk, errors) is returned in the
-// JSON response so it is visible in the Network tab.
 app.post('/api/questions/save-to-qdrant',requireAdmin,async(req,res)=>{
 const body=req.body||{}
 const requestId=(body.requestId||'').trim()||null
@@ -1252,7 +1200,8 @@ examType:body.examType||null,
 subject:body.subject||null,
 topic:body.topic||null,
 chapter:body.chapter||null,
-difficulty:body.difficulty||null
+difficulty:body.difficulty||null,
+adminQuery:body.query||body.adminQuery||null
 }
 let source='body'
 
@@ -1267,11 +1216,12 @@ if(!doc) return res.status(404).json({error:`No chat history found for requestId
 questions=doc.questions||[]
 meta={
 requestId,
-examType:doc.examType||null,
+examType:meta.examType||doc.examType||null,
 subject:doc.subject||null,
 topic:doc.topic||null,
 chapter:doc.chapter||null,
-difficulty:doc.difficulty||null
+difficulty:doc.difficulty||null,
+adminQuery:meta.adminQuery||doc.adminQuery||null
 }
 }
 
@@ -1312,18 +1262,6 @@ debug:e.debug||null
 }
 })
 
-// Admin-triggered upload of reviewed/generated questions into the predicted-
-// questions Mongo cluster (PREDICTQUES_URI). This is a deliberate, manual
-// action from the admin panel — nothing gets pushed here automatically.
-// Pass either:
-//  - { requestId, batchId?, examType?, subject?, topic?, marks?, negativeMarks? }
-//    to load questions from chat history and upload those, or
-//  - { questions:[...], batchId?, examType?, subject?, topic?, marks?, negativeMarks? }
-//    to upload an admin-edited/curated list directly.
-// Each question is validated against the predicted-questions schema
-// (English + Hindi content, resolvable correct_answer, subject) before
-// insertion; anything that fails validation is skipped and reported back
-// under "skipped" rather than silently dropped.
 app.post('/api/questions/upload-to-predicted',requireAdmin,async(req,res)=>{
 const body=req.body||{}
 const requestId=(body.requestId||'').trim()||null
@@ -1332,6 +1270,7 @@ let meta={
 examType:body.examType||null,
 subject:body.subject||null,
 topic:body.topic||null,
+adminQuery:body.query||body.adminQuery||null,
 marks:Number.isFinite(parseFloat(body.marks))?parseFloat(body.marks):null,
 negativeMarks:Number.isFinite(parseFloat(body.negativeMarks))?parseFloat(body.negativeMarks):null
 }
@@ -1355,6 +1294,7 @@ meta={
 examType:meta.examType||doc.examType||null,
 subject:meta.subject||doc.subject||null,
 topic:meta.topic||doc.topic||null,
+adminQuery:meta.adminQuery||doc.adminQuery||null,
 marks:meta.marks,
 negativeMarks:meta.negativeMarks
 }
@@ -1373,6 +1313,7 @@ const skipped=[]
 questions.forEach((q,i)=>{
 const doc=buildPredictedDoc(q,meta,batchId)
 const reasons=[]
+if(!doc.exam) reasons.push('missing exam (could not detect an exam name from the request text — pass examType explicitly)')
 if(!doc.subject) reasons.push('missing subject')
 if(!doc.english.question) reasons.push('missing English question')
 if(!doc.english.options||!Object.keys(doc.english.options).length) reasons.push('missing English options')
@@ -1489,14 +1430,26 @@ if(specs.length>MAX_TOPICS){
 specs=specs.slice(0,MAX_TOPICS)
 }
 
+const wideDetectionText=[query,body.topic,body.subject,body.chapter,Array.isArray(body.keywords)?body.keywords.join(' '):'']
+.filter(Boolean).join(' ')
+const detectedGlobalExam=detectExamTypeFromText(wideDetectionText)
+
 const globalFallback={
-examType:(body.examType||body.exam||'').trim()||null,
+examType:(body.examType||body.exam||'').trim()||detectedGlobalExam||null,
 subject:(body.subject||'').trim()||null,
 chapter:(body.chapter||'').trim()||null,
 difficulty:(body.difficulty||'').trim()||null,
 keywords:body.keywords||[]
 }
-specs=specs.map(s=>applyFallbacks(s,globalFallback))
+specs=specs.map(s=>{
+const merged=applyFallbacks(s,globalFallback)
+if(!merged.examType){
+const specText=[merged.topic,merged.subject,merged.chapter,Array.isArray(merged.keywords)?merged.keywords.join(' '):'']
+.filter(Boolean).join(' ')
+merged.examType=detectExamTypeFromText(specText)||detectedGlobalExam||null
+}
+return merged
+})
 
 const bodyCount=parseInt(body.count,10)
 specs=resolveSpecCounts(specs,Number.isFinite(bodyCount)?bodyCount:null)
@@ -1567,11 +1520,6 @@ questions,
 stats
 })
 
-// Chat history is still saved automatically for audit/history purposes.
-// Qdrant (generated_questions) and the predicted-questions cluster are
-// NOT touched automatically anymore — use POST /api/questions/save-to-qdrant
-// and POST /api/questions/upload-to-predicted respectively once the admin
-// has reviewed the batch.
 let mongoId=null
 let mongoError=null
 try{
